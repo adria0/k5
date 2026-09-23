@@ -64,6 +64,3 @@ pub(crate) struct ClientFinishedVd {
 pub(crate) struct ServerFinishedVd {
     pub handshake_hash: [u8; 32],
 }
-
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub(crate) struct CloseConnection;

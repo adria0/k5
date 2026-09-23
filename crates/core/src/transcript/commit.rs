@@ -80,7 +80,7 @@ pub struct TranscriptCommitConfig {
 
 impl TranscriptCommitConfig {
     /// Creates a new commit config builder.
-    pub fn builder(transcript: &Transcript) -> TranscriptCommitConfigBuilder {
+    pub fn builder(transcript: &Transcript) -> TranscriptCommitConfigBuilder<'_> {
         TranscriptCommitConfigBuilder::new(transcript)
     }
 

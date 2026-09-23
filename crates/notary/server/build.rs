@@ -33,7 +33,7 @@ fn get_commithash_with_dirty_suffix() -> Result<String, git2::Error> {
     }
 }
 
-fn get_commit(repo: &Repository) -> Result<Commit, git2::Error> {
+fn get_commit(repo: &Repository) -> Result<Commit<'_>, git2::Error> {
     let head = repo.head()?;
     head.peel_to_commit()
 }

@@ -2,7 +2,6 @@ use eyre::Result;
 use jsonwebtoken::{Algorithm as JwtAlgorithm, DecodingKey};
 use serde_json::Value;
 use strum::{EnumString, VariantNames};
-use tracing::error;
 
 use crate::JwtClaim;
 

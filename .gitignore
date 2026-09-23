@@ -29,3 +29,5 @@ target/
 
 # metrics
 *.csv
+db
+msg.md
