@@ -12,11 +12,9 @@ mod github;
 mod site;
 mod x;
 
-use std::fmt;
-
 use hyper::Uri;
 
-pub type Error = Box<dyn std::error::Error>;
+pub use crate::attestations::{Error, Profile};
 
 /// Registered plugins, in order of precedence.
 pub static PLUGINS: &[&dyn Plugin] = &[&x::X, &github::Github, &site::Site];
@@ -70,20 +68,6 @@ impl Session<'_> {
     }
 }
 
-/// A profile proven by a session, displayed as
-/// `<platform>/<user>/aiwot:<aiwot>`.
-pub struct Profile {
-    pub platform: &'static str,
-    pub user: String,
-    pub aiwot: String,
-}
-
-impl fmt::Display for Profile {
-    fn fmt(&self, f: &mut fmt::Formatter) -> fmt::Result {
-        write!(f, "{}/{}/aiwot:{}", self.platform, self.user, self.aiwot)
-    }
-}
-
 /// Resolves the URL given to `notarize` to the resource to request.
 pub fn target(url: &str) -> Result<Target, Error> {
     let uri: Uri = url.parse()?;
@@ -96,7 +80,9 @@ pub fn target(url: &str) -> Result<Target, Error> {
         return target;
     }
 
-    let host = uri.host().ok_or_else(|| format!("URL has no host: `{url}`"))?;
+    let host = uri
+        .host()
+        .ok_or_else(|| format!("URL has no host: `{url}`"))?;
 
     Ok(Target {
         host: host.to_string(),

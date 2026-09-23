@@ -104,7 +104,10 @@ mod tests {
         };
 
         assert!(X.matches(&session));
-        assert_eq!(X.profile(&session).unwrap().to_string(), "X/adria0/aiwot:ab12");
+        assert_eq!(
+            X.profile(&session).unwrap().to_string(),
+            "X/adria0/aiwot:ab12"
+        );
 
         let deleted = Session {
             recv: "HTTP/1.1 200 OK\r\n\r\n{\"__typename\":\"TweetTombstone\",\"tombstone\":{\"text\":{\"text\":\"This Post was deleted by the Post author.\"}}}",

@@ -58,7 +58,8 @@ pub struct SigningKey {
 }
 
 impl SigningKey {
-    fn from_seeds(ed25519_seed: [u8; 32], ml_dsa_44_seed: [u8; 32]) -> Self {
+    /// Deterministically derives a key from its seeds.
+    pub fn from_seeds(ed25519_seed: [u8; 32], ml_dsa_44_seed: [u8; 32]) -> Self {
         let (ml_dsa_44_public, ml_dsa_44) = ml_dsa_44::KG::keygen_from_seed(&ml_dsa_44_seed);
 
         Self {
@@ -110,7 +111,11 @@ pub fn aiwot(public: &[u8]) -> String {
 /// public key. Both signatures must be valid.
 pub fn verify(message: &[u8], public: &[u8], signature: &[u8]) -> Result<(), Error> {
     if public.len() != PUBLIC_LEN {
-        return Err(format!("public key must be {PUBLIC_LEN} bytes, got {}", public.len()).into());
+        return Err(format!(
+            "public key must be {PUBLIC_LEN} bytes, got {}",
+            public.len()
+        )
+        .into());
     }
     if signature.len() != SIGNATURE_LEN {
         return Err(format!(
@@ -164,7 +169,11 @@ impl Section for SigningKey {
             decode_hex("ed25519_seed", &config.ed25519_seed)?,
             decode_hex("ml_dsa_44_seed", &config.ml_dsa_44_seed)?,
         );
-        check_public("ed25519_public", &config.ed25519_public, &key.ed25519_public())?;
+        check_public(
+            "ed25519_public",
+            &config.ed25519_public,
+            &key.ed25519_public(),
+        )?;
         check_public(
             "ml_dsa_44_public",
             &config.ml_dsa_44_public,

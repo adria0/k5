@@ -85,7 +85,7 @@ impl SignedMessage {
 }
 
 /// Encodes as base58 in lines of at most [`LINE_WIDTH`] characters.
-fn encode(data: &[u8]) -> String {
+pub fn encode(data: &[u8]) -> String {
     let encoded = bs58::encode(data).into_string();
 
     encoded
@@ -96,7 +96,8 @@ fn encode(data: &[u8]) -> String {
         .join("\n")
 }
 
-fn decode(name: &str, section: &str) -> Result<Vec<u8>, Error> {
+/// Decodes base58 split in lines.
+pub fn decode(name: &str, section: &str) -> Result<Vec<u8>, Error> {
     let encoded: String = section.split_whitespace().collect();
 
     bs58::decode(encoded)

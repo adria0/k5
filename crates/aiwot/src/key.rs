@@ -4,15 +4,15 @@
 //   the aiwot id.
 // - `[kem]`: hybrid X25519MLKEM768 key encapsulation key.
 //
-// Missing sections are generated on startup. Other settings in the file are
-// preserved.
+// The file is created by `aiwot init`, and never generated implicitly. Other
+// settings in the file are preserved.
 
 mod kem;
 mod signing;
 
 use std::path::Path;
 
-pub use kem::KemKey;
+pub use kem::{encapsulate, KemKey};
 pub use signing::SigningKey;
 pub(crate) use signing::{aiwot, verify as verify_signature};
 
@@ -35,56 +35,76 @@ trait Section: Sized {
 /// The keys of this aiwot instance.
 pub struct Keys {
     pub signing: SigningKey,
-    // Not used yet.
-    #[allow(dead_code)]
     pub kem: KemKey,
-    /// Names of the sections generated in this run.
-    pub created: Vec<&'static str>,
 }
 
-/// Loads the keys from the config file, generating and storing the missing
-/// ones.
-pub fn load_or_create(path: &Path) -> Result<Keys, Error> {
+/// Generates new keys and stores them in a new config file. Fails if the file
+/// already exists, so keys are never overwritten.
+pub fn create(path: &Path) -> Result<Keys, Error> {
+    let keys = Keys {
+        signing: SigningKey::generate()?,
+        kem: KemKey::generate()?,
+    };
+    store(path, &keys, toml::Table::new())?;
+
+    Ok(keys)
+}
+
+/// Stores `keys` and `settings` in a new config file. Fails if the file
+/// already exists, so keys are never overwritten.
+pub fn store(path: &Path, keys: &Keys, settings: toml::Table) -> Result<(), Error> {
+    let mut config = settings;
+    config.insert(SigningKey::NAME.to_string(), keys.signing.to_toml()?);
+    config.insert(KemKey::NAME.to_string(), keys.kem.to_toml()?);
+    write_private(path, &toml::to_string(&config)?, true).map_err(|e| {
+        if e.kind() == std::io::ErrorKind::AlreadyExists {
+            format!(
+                "{} already exists: keys are not overwritten",
+                path.display()
+            )
+            .into()
+        } else {
+            Error::from(e)
+        }
+    })?;
+
+    Ok(())
+}
+
+/// Loads the keys from the config file. Rewrites a section if its stored
+/// form is outdated (e.g. a derived field is missing).
+pub fn load(path: &Path) -> Result<Keys, Error> {
     let mut config: toml::Table = match std::fs::read_to_string(path) {
         Ok(content) => content
             .parse()
             .map_err(|e| format!("invalid {}: {e}", path.display()))?,
-        Err(e) if e.kind() == std::io::ErrorKind::NotFound => toml::Table::new(),
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
+            return Err(format!(
+                "{} not found: run `aiwot init` to create your keys",
+                path.display()
+            )
+            .into())
+        }
         Err(e) => return Err(e.into()),
     };
 
     let mut changed = false;
-    let mut created = Vec::new();
-    let signing = section::<SigningKey>(&mut config, &mut changed, &mut created)
+    let signing = section::<SigningKey>(&mut config, &mut changed)
         .map_err(|e| format!("invalid [{}] in {}: {e}", SigningKey::NAME, path.display()))?;
-    let kem = section::<KemKey>(&mut config, &mut changed, &mut created)
+    let kem = section::<KemKey>(&mut config, &mut changed)
         .map_err(|e| format!("invalid [{}] in {}: {e}", KemKey::NAME, path.display()))?;
 
     if changed {
-        write_private(path, &toml::to_string(&config)?)?;
+        write_private(path, &toml::to_string(&config)?, false)?;
     }
 
-    Ok(Keys {
-        signing,
-        kem,
-        created,
-    })
+    Ok(Keys { signing, kem })
 }
 
-/// Loads a section, generating it if missing. Rewrites the section if its
-/// stored form is outdated (e.g. a derived field is missing).
-fn section<T: Section>(
-    config: &mut toml::Table,
-    changed: &mut bool,
-    created: &mut Vec<&'static str>,
-) -> Result<T, Error> {
-    let key = match config.get(T::NAME) {
-        Some(value) => T::from_toml(value.clone())?,
-        None => {
-            created.push(T::NAME);
-            T::generate()?
-        }
-    };
+/// Loads a section, which must exist. Updates it in `config` if its stored
+/// form is outdated.
+fn section<T: Section>(config: &mut toml::Table, changed: &mut bool) -> Result<T, Error> {
+    let key = T::from_toml(config.get(T::NAME).ok_or("missing section")?.clone())?;
 
     let value = key.to_toml()?;
     if config.get(T::NAME) != Some(&value) {
@@ -117,12 +137,23 @@ pub fn test_signing_key() -> SigningKey {
     SigningKey::generate().unwrap()
 }
 
-/// Writes a file readable only by the owner.
-fn write_private(path: &Path, content: &str) -> Result<(), Error> {
+/// A new random key encapsulation key.
+#[cfg(test)]
+pub fn test_kem_key() -> KemKey {
+    KemKey::generate().unwrap()
+}
+
+/// Writes a file readable only by the owner. With `create_new`, fails if the
+/// file exists.
+fn write_private(path: &Path, content: &str, create_new: bool) -> std::io::Result<()> {
     use std::io::Write;
 
     let mut options = std::fs::OpenOptions::new();
-    options.write(true).create(true).truncate(true);
+    if create_new {
+        options.write(true).create_new(true);
+    } else {
+        options.write(true).create(true).truncate(true);
+    }
     #[cfg(unix)]
     std::os::unix::fs::OpenOptionsExt::mode(&mut options, 0o600);
 
@@ -136,40 +167,52 @@ mod tests {
     use super::*;
 
     #[test]
-    fn test_load_or_create() {
+    fn test_create_load() {
         let dir = std::env::temp_dir().join(format!("aiwot-key-test-{}", std::process::id()));
         std::fs::create_dir_all(&dir).unwrap();
         let path = dir.join("aiwot.toml");
-        std::fs::write(&path, "other = 1\n").unwrap();
+        let _ = std::fs::remove_file(&path);
 
-        let keys = load_or_create(&path).unwrap();
-        assert_eq!(keys.created, ["key", "kem"]);
+        // Nothing is generated implicitly.
+        assert!(load(&path).is_err());
+        assert!(!path.exists());
 
-        let loaded = load_or_create(&path).unwrap();
-        assert!(loaded.created.is_empty());
+        let keys = create(&path).unwrap();
+        let loaded = load(&path).unwrap();
         assert_eq!(loaded.signing.aiwot(), keys.signing.aiwot());
         assert_eq!(loaded.kem.public(), keys.kem.public());
 
-        // Other settings are preserved.
+        // Existing keys are never overwritten.
+        assert!(create(&path).is_err());
+        assert_eq!(load(&path).unwrap().signing.aiwot(), keys.signing.aiwot());
+
+        // Other settings are preserved when a section is updated.
+        let mut config: toml::Table = std::fs::read_to_string(&path).unwrap().parse().unwrap();
+        config.insert("other".to_string(), toml::Value::Integer(1));
+        config["key"].as_table_mut().unwrap().remove("aiwot");
+        std::fs::write(&path, toml::to_string(&config).unwrap()).unwrap();
+        load(&path).unwrap();
         let config: toml::Table = std::fs::read_to_string(&path).unwrap().parse().unwrap();
         assert_eq!(config["other"].as_integer(), Some(1));
+        assert_eq!(
+            config["key"]["aiwot"].as_str(),
+            Some(keys.signing.aiwot().as_str())
+        );
 
-        // A missing section is generated without touching the others.
-        let mut config = config;
-        config.remove("kem");
-        std::fs::write(&path, toml::to_string(&config).unwrap()).unwrap();
-        let regenerated = load_or_create(&path).unwrap();
-        assert_eq!(regenerated.created, ["kem"]);
-        assert_eq!(regenerated.signing.aiwot(), keys.signing.aiwot());
-        assert_ne!(regenerated.kem.public(), keys.kem.public());
+        // A missing section is an error, not regenerated.
+        let mut without_kem = config.clone();
+        without_kem.remove("kem");
+        std::fs::write(&path, toml::to_string(&without_kem).unwrap()).unwrap();
+        assert!(load(&path).is_err());
 
         // A tampered public key is rejected.
+        std::fs::write(&path, toml::to_string(&config).unwrap()).unwrap();
         let tampered = std::fs::read_to_string(&path).unwrap().replace(
             &hex::encode(keys.signing.ed25519_public()),
             &"00".repeat(32),
         );
         std::fs::write(&path, tampered).unwrap();
-        assert!(load_or_create(&path).is_err());
+        assert!(load(&path).is_err());
 
         std::fs::remove_dir_all(&dir).unwrap();
     }

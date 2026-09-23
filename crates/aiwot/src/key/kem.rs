@@ -9,16 +9,29 @@
 //
 // The X25519MLKEM768 public key (as in draft-ietf-tls-ecdhe-mlkem) is
 // `ml_kem_768_public || x25519_public`. This key does not affect the aiwot id.
+//
+// Encapsulation to a public key produces `ml_kem_768_ciphertext (1088) ||
+// x25519_ephemeral_public (32)` and a 32 byte key derived with HKDF-SHA256
+// from `ml_kem_768_shared || x25519_shared`, bound to the ciphertext, the
+// recipient public key and a caller supplied context.
 
 use fips203::{
     ml_kem_768,
-    traits::{KeyGen, SerDes},
+    traits::{Decaps, Encaps, KeyGen, SerDes},
 };
+use hkdf::Hkdf;
 use serde::{Deserialize, Serialize};
+use sha2::Sha256;
 
 use super::{check_public, decode_hex, Error, Section};
 
 const ALGORITHM: &str = "X25519MLKEM768";
+
+const X25519_LEN: usize = 32;
+/// Length of an X25519MLKEM768 public key.
+pub const PUBLIC_LEN: usize = ml_kem_768::EK_LEN + X25519_LEN;
+/// Length of an X25519MLKEM768 encapsulation.
+pub const CIPHERTEXT_LEN: usize = ml_kem_768::CT_LEN + X25519_LEN;
 
 #[derive(Serialize, Deserialize)]
 struct KemConfig {
@@ -31,19 +44,16 @@ struct KemConfig {
 
 /// A hybrid X25519MLKEM768 key encapsulation key.
 pub struct KemKey {
-    // Not used for decapsulation yet.
-    #[allow(dead_code)]
     pub x25519: x25519_dalek::StaticSecret,
     x25519_public: x25519_dalek::PublicKey,
-    // Not used for decapsulation yet.
-    #[allow(dead_code)]
     pub ml_kem_768: ml_kem_768::DecapsKey,
     ml_kem_768_public: ml_kem_768::EncapsKey,
     ml_kem_768_seed: [u8; 64],
 }
 
 impl KemKey {
-    fn from_secrets(x25519_secret: [u8; 32], ml_kem_768_seed: [u8; 64]) -> Self {
+    /// Deterministically derives a key from its secrets.
+    pub fn from_secrets(x25519_secret: [u8; 32], ml_kem_768_seed: [u8; 64]) -> Self {
         let x25519 = x25519_dalek::StaticSecret::from(x25519_secret);
 
         let mut d = [0u8; 32];
@@ -70,13 +80,107 @@ impl KemKey {
     }
 
     /// The X25519MLKEM768 public key: `ml_kem_768_public || x25519_public`.
-    // Not used yet.
-    #[allow(dead_code)]
     pub fn public(&self) -> Vec<u8> {
         let mut public = self.ml_kem_768_public();
         public.extend(self.x25519_public());
         public
     }
+
+    /// Recovers the key of an [`encapsulate`] to this key's public key.
+    pub fn decapsulate(&self, ciphertext: &[u8], context: &[u8]) -> Result<[u8; 32], Error> {
+        if ciphertext.len() != CIPHERTEXT_LEN {
+            return Err(format!(
+                "KEM ciphertext must be {CIPHERTEXT_LEN} bytes, got {}",
+                ciphertext.len()
+            )
+            .into());
+        }
+        let (ml_kem_ct, x25519_ephemeral) = ciphertext.split_at(ml_kem_768::CT_LEN);
+
+        let ml_kem_ct = ml_kem_768::CipherText::try_from_bytes(ml_kem_ct.try_into()?)?;
+        let ml_kem_shared = self.ml_kem_768.try_decaps(&ml_kem_ct)?.into_bytes();
+
+        let x25519_ephemeral: [u8; X25519_LEN] = x25519_ephemeral.try_into()?;
+        let x25519_shared = self
+            .x25519
+            .diffie_hellman(&x25519_dalek::PublicKey::from(x25519_ephemeral));
+        if !x25519_shared.was_contributory() {
+            return Err("invalid X25519 ephemeral key".into());
+        }
+
+        combine(
+            &ml_kem_shared,
+            x25519_shared.as_bytes(),
+            ciphertext,
+            &self.public(),
+            context,
+        )
+    }
+}
+
+/// Encapsulates a fresh key to an X25519MLKEM768 `public` key, returning the
+/// ciphertext and the key.
+pub fn encapsulate(public: &[u8], context: &[u8]) -> Result<(Vec<u8>, [u8; 32]), Error> {
+    if public.len() != PUBLIC_LEN {
+        return Err(format!(
+            "KEM public key must be {PUBLIC_LEN} bytes, got {}",
+            public.len()
+        )
+        .into());
+    }
+    let (ml_kem_public, x25519_public) = public.split_at(ml_kem_768::EK_LEN);
+
+    let mut seed = [0u8; 32];
+    getrandom::getrandom(&mut seed)?;
+    let ml_kem_public = ml_kem_768::EncapsKey::try_from_bytes(ml_kem_public.try_into()?)?;
+    let (ml_kem_shared, ml_kem_ct) = ml_kem_public.encaps_from_seed(&seed);
+
+    let mut ephemeral = [0u8; X25519_LEN];
+    getrandom::getrandom(&mut ephemeral)?;
+    let ephemeral = x25519_dalek::StaticSecret::from(ephemeral);
+    let x25519_public: [u8; X25519_LEN] = x25519_public.try_into()?;
+    let x25519_shared = ephemeral.diffie_hellman(&x25519_dalek::PublicKey::from(x25519_public));
+    if !x25519_shared.was_contributory() {
+        return Err("invalid X25519 public key".into());
+    }
+
+    let mut ciphertext = ml_kem_ct.into_bytes().to_vec();
+    ciphertext.extend(x25519_dalek::PublicKey::from(&ephemeral).as_bytes());
+
+    let key = combine(
+        &ml_kem_shared.into_bytes(),
+        x25519_shared.as_bytes(),
+        &ciphertext,
+        public,
+        context,
+    )?;
+
+    Ok((ciphertext, key))
+}
+
+/// Derives the key from both shared secrets with HKDF-SHA256, binding the
+/// ciphertext, the recipient public key and the context.
+fn combine(
+    ml_kem_shared: &[u8],
+    x25519_shared: &[u8],
+    ciphertext: &[u8],
+    public: &[u8],
+    context: &[u8],
+) -> Result<[u8; 32], Error> {
+    let mut ikm = ml_kem_shared.to_vec();
+    ikm.extend(x25519_shared);
+
+    let mut info = b"aiwot X25519MLKEM768 v1".to_vec();
+    info.extend(ciphertext);
+    info.extend(public);
+    info.extend(context);
+
+    let mut key = [0u8; 32];
+    Hkdf::<Sha256>::new(None, &ikm)
+        .expand(&info, &mut key)
+        .map_err(|_| "HKDF expand failed")?;
+
+    Ok(key)
 }
 
 impl Section for KemKey {
@@ -143,10 +247,15 @@ mod tests {
         // The restored ML-KEM key decapsulates what the original public key
         // encapsulates.
         let (shared, ciphertext) = key.ml_kem_768_public.encaps_from_seed(&[3; 32]);
-        assert_eq!(
-            restored.ml_kem_768.try_decaps(&ciphertext).unwrap(),
-            shared
-        );
+        assert_eq!(restored.ml_kem_768.try_decaps(&ciphertext).unwrap(), shared);
+
+        // Hybrid encapsulation round trip, bound to the context.
+        let (ciphertext, key_a) = encapsulate(&key.public(), b"ctx").unwrap();
+        assert_eq!(ciphertext.len(), CIPHERTEXT_LEN);
+        assert_eq!(restored.decapsulate(&ciphertext, b"ctx").unwrap(), key_a);
+        assert_ne!(restored.decapsulate(&ciphertext, b"other").unwrap(), key_a);
+        let other = KemKey::generate().unwrap();
+        assert_ne!(other.decapsulate(&ciphertext, b"ctx").unwrap(), key_a);
 
         // The restored X25519 key agrees with the original.
         let peer = x25519_dalek::StaticSecret::from([7; 32]);
