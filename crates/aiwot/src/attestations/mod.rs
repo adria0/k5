@@ -2,8 +2,8 @@
 //
 // - `tlsnotary`: a TLSNotary notarized session with a server, whose profile is
 //   extracted by the `tlsnotary::plugins` (`- Type: tlsn`).
-// - `keysignparty`: another aiwot signs that it knows the owner of an aiwot
-//   (`- Type: keysignparty`).
+// - `keysignparty`: another aiwot signs that it knows the owner of an aiwot (`-
+//   Type: keysignparty`).
 // - `me`: an aiwot signs its own public keys, including the key encapsulation
 //   key (`- Type: self_attestation`, formerly `me`). Created automatically for
 //   the local keys.

@@ -1,12 +1,14 @@
-// Signcrypted messages: signed by the sender and encrypted to the X25519MLKEM768
-// key of the recipient, taken from its verified self attestation (`me`).
+// Signcrypted messages: signed by the sender and encrypted to the
+// X25519MLKEM768 key of the recipient, taken from its verified self attestation
+// (`me`).
 //
 // # to
 // <aiwot of the recipient>
 // # kem
 // <X25519MLKEM768 encapsulation, base58, 100 characters per line>
 // # ciphertext
-// <ChaCha20-Poly1305 encryption of the signed message, base58, 100 characters per line>
+// <ChaCha20-Poly1305 encryption of the signed message, base58, 100 characters
+// per line>
 //
 // The encrypted signed message (`# from`, `# msg`, `# pbk`, `# signature`)
 // signs

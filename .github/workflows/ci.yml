@@ -59,14 +59,14 @@ jobs:
       - name: Install nightly rust toolchain with rustfmt
         uses: dtolnay/rust-toolchain@stable
         with:
-          toolchain: nightly
+          toolchain: nightly-2026-02-15
           components: rustfmt
 
       - name: Use caching
         uses: Swatinem/rust-cache@v2.7.7
 
       - name: Check formatting
-        run: cargo +nightly fmt --check --all
+        run: cargo +nightly-2026-02-15 fmt --check --all
 
   build-and-test:
     name: Build and test
