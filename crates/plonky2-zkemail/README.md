@@ -26,7 +26,7 @@ circuit-size measures, not an R1CS-style count of individual constraints.
 
 ## Complete example from a real .eml file
 
-With Node.js 18+ installed (no npm packages required), run:
+Run:
 
 ```sh
 cargo run --release --example verify_eml
@@ -36,8 +36,8 @@ This reads the self-contained `examples/fixtures/test.eml` fixture and:
 
 1. Restores SMTP line endings, parses folded headers, and applies DKIM
    relaxed/relaxed canonicalization, selecting signed headers in `h=` order.
-2. Checks the body hash and RSA signature using Node's built-in crypto and the
-   pinned public record in `examples/fixtures/icloud-dkim.json`.
+2. Checks the body hash and RSA signature in Rust using the pinned public
+   record in `examples/fixtures/icloud-dkim.json`.
 3. Pads the canonicalized header and complete body for SHA-256 and prepares the
    Plonky2 witnesses. The example constrains the body chaining state to SHA's
    initial state, disabling prefix skipping for this proof.
@@ -57,8 +57,8 @@ cargo run --release --example verify_eml -- /path/to/email.eml /path/to/trusted-
 ```
 
 The key JSON uses the same `domain`, `selector`, and `record` fields as the
-included fixture. The adapter in `examples/eml/prepare.mjs` intentionally
-supports one `rsa-sha256` signature, `relaxed/relaxed` canonicalization, a
+included fixture. The adapter in `eml` intentionally supports one
+`rsa-sha256` signature, `relaxed/relaxed` canonicalization, a
 2048-bit RSA/SPKI key with exponent 65537, and the circuit's `bh=` formatting.
 It rejects `l=` partial-body signatures, duplicate tags, unsupported modes,
 and domain/selector mismatches. It is a bounded example, not a general mail
@@ -68,8 +68,7 @@ policy. Canonicalization follows [RFC 6376](https://www.rfc-editor.org/rfc/rfc63
 Fast preparation and regression checks (without generating a large proof):
 
 ```sh
-node --test examples/eml/prepare.test.mjs
-cargo test --lib embedded_helper_prepares_fixture
+cargo test --lib eml::tests
 ```
 
 These cover the existing Circom fixture's header digest, line endings,

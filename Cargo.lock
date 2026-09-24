@@ -5096,11 +5096,13 @@ name = "plonky2-zkemail"
 version = "0.1.0"
 dependencies = [
  "anyhow",
+ "base64 0.22.1",
  "num-bigint",
  "num-traits",
  "plonky2",
  "serde",
  "serde_json",
+ "sha2",
 ]
 
 [[package]]
