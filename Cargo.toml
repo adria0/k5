@@ -29,6 +29,7 @@ members = [
     "crates/harness/executor",
     "crates/harness/runner",
 ]
+exclude = ["crates/plonky2-zkemail"]
 resolver = "2"
 
 [workspace.lints.rust]

@@ -463,14 +463,15 @@ fn fake_profiles(rng: &mut Rng, names: &[String]) -> Vec<Vec<(&'static str, Stri
 /// The identities each identity keysigns, following the Holme–Kim model.
 ///
 /// The [`ROOTS`] keysign each other. Then each identity joins with 1 to 3
-/// links (with probabilities 5/8, 1/4 and 1/8) to earlier identities. The first link goes to an identity chosen with probability
-/// proportional to its connections (preferential attachment); each further
-/// link, with probability [`TRIAD_PROBABILITY`], to a friend of the previous
-/// link (triad formation), otherwise again by preferential attachment. The
-/// earlier identity keysigns the newcomer, so everyone is reachable from the
-/// roots, and the newcomer keysigns back its first link, so everyone keysigns
-/// at least one identity, and its further links with probability
-/// [`RECIPROCITY`]. No identity keysigns more than [`MAX_CONNECTIONS`].
+/// links (with probabilities 5/8, 1/4 and 1/8) to earlier identities. The first
+/// link goes to an identity chosen with probability proportional to its
+/// connections (preferential attachment); each further link, with probability
+/// [`TRIAD_PROBABILITY`], to a friend of the previous link (triad formation),
+/// otherwise again by preferential attachment. The earlier identity keysigns
+/// the newcomer, so everyone is reachable from the roots, and the newcomer
+/// keysigns back its first link, so everyone keysigns at least one identity,
+/// and its further links with probability [`RECIPROCITY`]. No identity keysigns
+/// more than [`MAX_CONNECTIONS`].
 fn graph(rng: &mut Rng, n: usize) -> Vec<BTreeSet<usize>> {
     let mut graph = Graph {
         keysigns: vec![BTreeSet::new(); n],

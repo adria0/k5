@@ -51,6 +51,21 @@ enum Command {
     /// Write a Graphviz digraph of the verified attestations: keysigns
     /// between aiwots, and the social profiles of each aiwot.
     Makedot(MakedotArgs),
+    #[cfg(feature = "zkemail")]
+    /// Generate a Plonky2 proof for a DKIM-signed email.
+    Zkemail(ZkemailArgs),
+}
+
+#[cfg(feature = "zkemail")]
+#[derive(Args, Debug)]
+struct ZkemailArgs {
+    /// DKIM-signed RFC 5322 email file.
+    eml: std::path::PathBuf,
+    /// JSON file containing the trusted DKIM domain, selector, and TXT record.
+    dkim: std::path::PathBuf,
+    /// File to which the serialized Plonky2 proof is written.
+    #[clap(long)]
+    output: std::path::PathBuf,
 }
 
 #[derive(Args, Debug)]
@@ -252,6 +267,13 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     let cli = Cli::parse();
 
+    #[cfg(feature = "zkemail")]
+    {
+        if let Command::Zkemail(args) = &cli.command {
+            return run_zkemail(args);
+        }
+    }
+
     let keys = match cli.command {
         Command::Init => key::create(&cli.config)?,
         _ => key::load(&cli.config)?,
@@ -289,7 +311,27 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             MsgCommand::Signcrypt(args) => run_signcrypt(&args, &keys.signing).await,
             MsgCommand::Verify(args) => run_verify(&args, &keys).await,
         },
+        #[cfg(feature = "zkemail")]
+        Command::Zkemail(_) => unreachable!("zkemail is handled before loading aiwot keys"),
     }
+}
+
+/// Generates a proof synchronously because proving is CPU-bound and this
+/// command performs no concurrent asynchronous work.
+#[cfg(feature = "zkemail")]
+fn run_zkemail(args: &ZkemailArgs) -> Result<(), Box<dyn std::error::Error>> {
+    let proof = plonky2_zkemail::eml::prove(&args.eml, &args.dkim)?;
+    std::fs::write(&args.output, &proof.bytes)?;
+    println!(
+        "Generated {}-byte proof for d={}, s={} ({} gate rows, {} padded rows): {}",
+        proof.bytes.len(),
+        proof.domain,
+        proof.selector,
+        proof.gate_rows,
+        proof.padded_rows,
+        args.output.display()
+    );
+    Ok(())
 }
 
 async fn run_notarize(args: &NotarizeArgs) -> Result<(), Box<dyn std::error::Error>> {

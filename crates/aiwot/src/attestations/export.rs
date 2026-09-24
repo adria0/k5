@@ -36,6 +36,8 @@ pub struct Exported {
     pub record: String,
 }
 
+type VerifiedExport = (Exported, Result<ProfileAttestation, String>);
+
 /// Creates a signed export of the valid attestations in [`DIR`], returning
 /// the signed message markdown and the number of exported attestations.
 /// Invalid records are reported and skipped.
@@ -227,10 +229,7 @@ async fn store(
 }
 
 /// Verifies each attestation of an export.
-fn verify_all(
-    msg: &str,
-    notary_key: &str,
-) -> Result<Vec<(Exported, Result<ProfileAttestation, String>)>, Error> {
+fn verify_all(msg: &str, notary_key: &str) -> Result<Vec<VerifiedExport>, Error> {
     Ok(parse(msg)?
         .into_iter()
         .map(|exported| {
