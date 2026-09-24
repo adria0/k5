@@ -54,6 +54,21 @@ This repository contains the source code for the Rust implementation of the TLSN
 
 ## Development
 
+### zk-email proof generation
+
+The `aiwot` CLI can generate a Plonky2 proof for a supported DKIM-signed
+`.eml` file. Pass a trusted DKIM JSON record containing `domain`, `selector`,
+and `record` fields; the CLI writes the serialized proof to `--output`:
+
+```sh
+cargo +nightly-2025-07-02 run --release -p aiwot --features zkemail -- \
+  zkemail path/to/message.eml path/to/dkim.json --output email.proof
+```
+
+The CLI must be run with `--release`; without release mode, the prover is too
+slow. Node.js 18 or later is also required for DKIM parsing, canonicalization,
+and signature validation.
+
 > [!IMPORTANT]
 > **Note on Rust-to-WASM Compilation**: This project requires compiling Rust into WASM, which needs [`clang`](https://clang.llvm.org/) version 16.0.0 or newer. MacOS users, be aware that Xcode's default `clang` might be older. If you encounter the error `No available targets are compatible with triple "wasm32-unknown-unknown"`, it's likely due to an outdated `clang`. Updating `clang` to a newer version should resolve this issue.
 > 

@@ -8,6 +8,9 @@ version = "0.1.0"
 [lints]
 workspace = true
 
+[features]
+zkemail = ["dep:plonky2-zkemail"]
+
 [dependencies]
 notary-client = { workspace = true }
 tlsn-common = { workspace = true }
@@ -17,6 +20,7 @@ tlsn-prover = { workspace = true }
 spansy = { workspace = true }
 rangeset = { workspace = true }
 regex = { workspace = true }
+plonky2-zkemail = { path = "../plonky2-zkemail", optional = true }
 
 base64 = { version = "0.22" }
 bincode = { workspace = true }
