@@ -2,7 +2,7 @@
 //
 // The message is a bundle with each record encoded as base58:
 //
-// aiwot export
+// k5 export
 // date:<creation time, RFC 3339>
 // count:<number of attestations>
 // attestation:<file name>
@@ -15,19 +15,19 @@
 //
 // Merging follows the web of trust. Key sign party attestations are edges
 // `signer -> subject`, from the local attestations and the export; the
-// trusted aiwots are the local one and all those reachable from it. First, the
+// trusted k5s are the local one and all those reachable from it. First, the
 // key sign party attestations whose signer is trusted are merged; then, the
-// other attestations about trusted aiwots. The rest are reported as untrusted.
+// other attestations about trusted k5s. The rest are reported as untrusted.
 
 use std::collections::{HashMap, HashSet};
 
-use super::{check, keyring, keysignparty, Error, ProfileAttestation, DIR};
+use super::{check, keyring, keysignparty, Error, Invalid, ProfileAttestation, DIR};
 use crate::{
     key::Keys,
     message::{self, Keyring},
 };
 
-const HEADER: &str = "aiwot export";
+const HEADER: &str = "k5 export";
 const ATTESTATION_PREFIX: &str = "attestation:";
 /// Maximum length of the base58 lines.
 const LINE_WIDTH: usize = 100;
@@ -40,28 +40,42 @@ pub struct Exported {
 
 type VerifiedExport = (Exported, Result<ProfileAttestation, String>);
 
-/// Creates a signed export of the valid attestations in [`DIR`], returning
-/// the signed message markdown and the number of exported attestations.
-/// Invalid records are reported and skipped.
-pub async fn create(keys: &Keys, notary_key: &str) -> Result<(String, usize), Error> {
+/// A signed export.
+pub struct Export {
+    /// The signed message markdown.
+    pub markdown: String,
+    /// Number of exported attestations.
+    pub count: usize,
+    /// Invalid records in [`DIR`], not exported.
+    pub skipped: Vec<Invalid>,
+}
+
+/// Creates a signed export of the valid attestations in [`DIR`]. Invalid
+/// records are skipped.
+pub async fn create(keys: &Keys, notary_key: &str) -> Result<Export, Error> {
     let mut exported = Vec::new();
+    let mut skipped = Vec::new();
     for checked in check(None, notary_key).await? {
         match checked.result {
             Ok(_) => exported.push(Exported {
                 record: tokio::fs::read_to_string(format!("{DIR}/{}", checked.file)).await?,
                 file: checked.file,
             }),
-            Err(e) => eprintln!(
-                "Not exporting invalid attestation {DIR}/{}: {e}",
-                checked.file
-            ),
+            Err(error) => skipped.push(Invalid {
+                file: checked.file,
+                error,
+            }),
         }
     }
 
     let date = chrono::Utc::now().to_rfc3339_opts(chrono::SecondsFormat::Secs, true);
-    let armored = message::sign(&keys.secret, &bundle(&date, &exported))?;
+    let markdown = message::sign(&keys.secret, &bundle(&date, &exported))?;
 
-    Ok((armored, exported.len()))
+    Ok(Export {
+        markdown,
+        count: exported.len(),
+        skipped,
+    })
 }
 
 /// Returns whether a signed message is an export.
@@ -93,7 +107,7 @@ pub enum Outcome {
     /// A different record with the same name exists, and `force` is not set.
     Conflict(ProfileAttestation),
     /// There is no trust path to the signer of a key sign party attestation,
-    /// or to the aiwot of any other attestation.
+    /// or to the k5 of any other attestation.
     Untrusted(ProfileAttestation),
     Invalid(String),
 }
@@ -162,7 +176,7 @@ pub fn is_keysign(attestation: &ProfileAttestation) -> bool {
     attestation.profile.platform == keysignparty::RECORD_TYPE
 }
 
-/// Returns the aiwots reachable from `me` through the key sign party
+/// Returns the k5s reachable from `me` through the key sign party
 /// attestations, `me` included.
 pub fn trusted<'a>(
     me: &str,
@@ -174,15 +188,15 @@ pub fn trusted<'a>(
             edges
                 .entry(signer.as_str())
                 .or_default()
-                .push(attestation.profile.aiwot.as_str());
+                .push(attestation.profile.k5.as_str());
         }
     }
 
     let me = me.to_ascii_lowercase();
     let mut trusted = HashSet::from([me.clone()]);
     let mut pending = vec![me];
-    while let Some(aiwot) = pending.pop() {
-        for subject in edges.get(aiwot.as_str()).into_iter().flatten() {
+    while let Some(k5) = pending.pop() {
+        for subject in edges.get(k5.as_str()).into_iter().flatten() {
             if trusted.insert(subject.to_string()) {
                 pending.push(subject.to_string());
             }
@@ -193,7 +207,7 @@ pub fn trusted<'a>(
 }
 
 /// A key sign party attestation is trusted if its signer is; any other
-/// attestation if the aiwot it is about is.
+/// attestation if the k5 it is about is.
 fn is_trusted(attestation: &ProfileAttestation, trusted: &HashSet<String>) -> bool {
     if is_keysign(attestation) {
         attestation
@@ -201,7 +215,7 @@ fn is_trusted(attestation: &ProfileAttestation, trusted: &HashSet<String>) -> bo
             .as_ref()
             .is_some_and(|signer| trusted.contains(signer))
     } else {
-        trusted.contains(&attestation.profile.aiwot)
+        trusted.contains(&attestation.profile.k5)
     }
 }
 
@@ -361,8 +375,8 @@ mod tests {
     #[tokio::test]
     async fn test_bundle_round_trip() {
         let signer = test_keys();
-        let subject = test_keys().aiwot();
-        let keyring = Keyring::from([(signer.aiwot(), signer.public())]);
+        let subject = test_keys().k5();
+        let keyring = Keyring::from([(signer.k5(), signer.public())]);
         let (file, record) = keysignparty::create(&signer, &subject, "Alice", false).unwrap();
 
         let exported = vec![
@@ -391,7 +405,7 @@ mod tests {
         let checked = verify_all(&msg, "", &keyring).unwrap();
         assert_eq!(
             checked[0].1.as_ref().unwrap().to_string(),
-            format!("keysignparty:Alice (signed by aiwot:{})", signer.aiwot())
+            format!("keysignparty:Alice (signed by k5:{})", signer.k5())
         );
         assert!(checked[1].1.is_err());
 
@@ -405,16 +419,15 @@ mod tests {
 
         let [me_key, bob, carol, dave, eve, frank] = std::array::from_fn(|_| test_keys());
         let keysign = |signer: &Keys, subject: &Keys| {
-            let (file, record) =
-                keysignparty::create(signer, &subject.aiwot(), "x", false).unwrap();
-            let keyring = Keyring::from([(signer.aiwot(), signer.public())]);
+            let (file, record) = keysignparty::create(signer, &subject.k5(), "x", false).unwrap();
+            let keyring = Keyring::from([(signer.k5(), signer.public())]);
             Attested::KeySign(keysignparty::verify(&record, &keyring).unwrap())
                 .attestation(file)
                 .unwrap()
         };
         let me_attestation = |key: &Keys| {
             let record = me::create(key, false).unwrap();
-            Attested::Me(me::verify(&record).unwrap())
+            Attested::Me(Box::new(me::verify(&record).unwrap()))
                 .attestation(String::new())
                 .unwrap()
         };
@@ -430,10 +443,10 @@ mod tests {
             me_attestation(&frank),
         ];
 
-        let trusted = trusted(&me_key.aiwot(), local.iter().chain(exported.iter()));
+        let trusted = trusted(&me_key.k5(), local.iter().chain(exported.iter()));
         let expected: HashSet<String> = [&me_key, &bob, &carol, &dave]
             .iter()
-            .map(|key| key.aiwot())
+            .map(|key| key.k5())
             .collect();
         assert_eq!(trusted, expected);
 
@@ -463,13 +476,13 @@ mod tests {
 
         // A valid record under a path escaping the directory is rejected.
         let signer = test_keys();
-        let subject = test_keys().aiwot();
+        let subject = test_keys().k5();
         let (file, record) = keysignparty::create(&signer, &subject, "Alice", false).unwrap();
         let exported = Exported {
             file: format!("{subject}-../../{file}"),
             record,
         };
-        let keyring = Keyring::from([(signer.aiwot(), signer.public())]);
+        let keyring = Keyring::from([(signer.k5(), signer.public())]);
         assert!(verify_one(&exported, "", &keyring).is_err());
     }
 }

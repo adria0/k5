@@ -1,7 +1,7 @@
 // Profile plugins.
 //
 // A plugin recognizes a platform (X, GitHub, a website, ...) and extracts a
-// profile `<platform>/<user>/aiwot:<hex>` from a verified TLS session. A
+// profile `<platform>/<user>/k5:<hex>` from a verified TLS session. A
 // plugin may also rewrite the URL given to `notarize` into the resource that
 // is actually requested (e.g. a tweet URL into the syndication API).
 //
@@ -48,7 +48,7 @@ pub struct Session<'a> {
 }
 
 impl Session<'_> {
-    /// Returns the target of the first request line, e.g. `/aiwot.txt`.
+    /// Returns the target of the first request line, e.g. `/k5.txt`.
     pub fn request_target(&self) -> Option<&str> {
         self.sent.lines().next()?.split(' ').nth(1)
     }
@@ -104,9 +104,9 @@ pub fn profile(session: &Session) -> Option<Result<Profile, Error>> {
         .map(|plugin| plugin.profile(session))
 }
 
-/// Returns the hex value following the first `aiwot:` in `text`.
-pub fn find_aiwot(text: &str) -> Option<&str> {
-    text.match_indices("aiwot:").find_map(|(idx, prefix)| {
+/// Returns the hex value following the first `k5:` in `text`.
+pub fn find_k5(text: &str) -> Option<&str> {
+    text.match_indices("k5:").find_map(|(idx, prefix)| {
         let rest = &text[idx + prefix.len()..];
         let len = rest
             .find(|c: char| !c.is_ascii_hexdigit())
@@ -120,10 +120,10 @@ mod tests {
     use super::*;
 
     #[test]
-    fn test_find_aiwot() {
-        assert_eq!(find_aiwot("hello aiwot:ab12, bye"), Some("ab12"));
-        assert_eq!(find_aiwot("aiwot: aiwot:ff"), Some("ff"));
-        assert_eq!(find_aiwot("nothing here"), None);
+    fn test_find_k5() {
+        assert_eq!(find_k5("hello k5:ab12, bye"), Some("ab12"));
+        assert_eq!(find_k5("k5: k5:ff"), Some("ff"));
+        assert_eq!(find_k5("nothing here"), None);
     }
 
     #[test]

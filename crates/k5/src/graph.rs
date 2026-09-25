@@ -1,33 +1,33 @@
-// Graphviz digraph of the attestations: which aiwot keysigns which, and the
-// social profiles (TLSNotary attestations, real or fake) of each aiwot.
+// Graphviz digraph of the attestations: which k5 keysigns which, and the
+// social profiles (TLSNotary attestations, real or fake) of each k5.
 //
 // Nodes are labeled with their profiles, one per line (`X:handle`,
-// `github:user`, `site:domain`). An aiwot without profiles is labeled with its
-// hex, split in lines of 8 characters. The local aiwot has a double border,
-// and aiwots with fake profiles a dashed one.
+// `github:user`, `site:domain`). A k5 without profiles is labeled with its
+// hex, split in lines of 8 characters. The local k5 has a double border,
+// and k5s with fake profiles a dashed one.
 
 use std::collections::{BTreeMap, BTreeSet};
 
 use crate::attestations::{export, me, ProfileAttestation};
 
-/// Length of the lines of an aiwot hex in a label.
+/// Length of the lines of a k5 hex in a label.
 const HEX_LINE: usize = 8;
 
-/// The profiles of an aiwot.
+/// The profiles of a k5.
 #[derive(Default)]
 struct Node {
     profiles: BTreeSet<String>,
     fake: bool,
 }
 
-/// Builds the digraph of `attestations`, `me` being the local aiwot.
+/// Builds the digraph of `attestations`, `me` being the local k5.
 pub fn dot(me: &str, attestations: &[ProfileAttestation]) -> String {
     let mut nodes: BTreeMap<&str, Node> = BTreeMap::new();
     let mut edges: BTreeSet<(&str, &str)> = BTreeSet::new();
 
     nodes.entry(me).or_default();
     for attestation in attestations {
-        let subject = attestation.profile.aiwot.as_str();
+        let subject = attestation.profile.k5.as_str();
         let node = nodes.entry(subject).or_default();
 
         if export::is_keysign(attestation) {
@@ -44,11 +44,10 @@ pub fn dot(me: &str, attestations: &[ProfileAttestation]) -> String {
         }
     }
 
-    let mut dot = String::from("digraph aiwot {\n    node [shape=box];\n");
-    for (aiwot, node) in &nodes {
+    let mut dot = String::from("digraph k5 {\n    node [shape=box];\n");
+    for (k5, node) in &nodes {
         let label = if node.profiles.is_empty() {
-            aiwot
-                .as_bytes()
+            k5.as_bytes()
                 .chunks(HEX_LINE)
                 .map(|line| String::from_utf8_lossy(line).into_owned())
                 .collect::<Vec<_>>()
@@ -62,13 +61,13 @@ pub fn dot(me: &str, attestations: &[ProfileAttestation]) -> String {
         };
 
         let mut attributes = vec![format!("label=\"{label}\"")];
-        if *aiwot == me {
+        if *k5 == me {
             attributes.push("peripheries=2".to_string());
         }
         if node.fake {
             attributes.push("style=dashed".to_string());
         }
-        dot.push_str(&format!("    \"{aiwot}\" [{}];\n", attributes.join(", ")));
+        dot.push_str(&format!("    \"{k5}\" [{}];\n", attributes.join(", ")));
     }
     for (signer, subject) in &edges {
         dot.push_str(&format!("    \"{signer}\" -> \"{subject}\";\n"));
@@ -91,7 +90,7 @@ mod tests {
     fn attestation(
         platform: &'static str,
         user: &str,
-        aiwot: &str,
+        k5: &str,
         signer: Option<&str>,
         fake: bool,
     ) -> ProfileAttestation {
@@ -99,7 +98,7 @@ mod tests {
             profile: Profile {
                 platform,
                 user: user.to_string(),
-                aiwot: aiwot.to_string(),
+                k5: k5.to_string(),
             },
             signer: signer.map(str::to_string),
             attributes: Vec::new(),
@@ -125,7 +124,7 @@ mod tests {
         assert_eq!(
             dot,
             format!(
-                "digraph aiwot {{\n    node [shape=box];\n    \
+                "digraph k5 {{\n    node [shape=box];\n    \
                  \"{me}\" [label=\"aaaaaaaa\\naaaaaaaa\\naaaaaaaa\\naaaaaaaa\\naaaaaaaa\\naaaaaaaa\\naaaaaaaa\\naaaaaaaa\", peripheries=2];\n    \
                  \"{bob}\" [label=\"X:bob\\ngithub:bob\\\"\"];\n    \
                  \"{carol}\" [label=\"site:carol.com\", style=dashed];\n    \

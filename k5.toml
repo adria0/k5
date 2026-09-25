@@ -1,5 +1,5 @@
 [key]
-aiwot = "f1e98004580d1f9bb6c3a316dd1bbf881482f5c1ad59add93271519819e01afb"
+k5 = "f1e98004580d1f9bb6c3a316dd1bbf881482f5c1ad59add93271519819e01afb"
 algorithm = "MlDsa65Ed25519+MlKem768X25519"
 secret_key = """
 -----BEGIN PGP PRIVATE KEY BLOCK-----

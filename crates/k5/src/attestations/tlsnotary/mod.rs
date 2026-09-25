@@ -51,24 +51,32 @@ pub struct NotaryConfig {
     pub max_recv: usize,
 }
 
+/// The result of [`attest`].
+pub struct Notarized {
+    /// Path of the stored attestation record, or why none was stored (no
+    /// plugin recognizes the profile).
+    pub record: Result<String, String>,
+}
+
 /// Notarizes `url`, writing the presentation to `presentation_path` and, if a
 /// plugin extracts a profile from the session, an attestation record to
-/// [`DIR`]. Returns the path of the record, if stored.
+/// [`DIR`]. `progress` receives a message at each step of the notarization.
 pub async fn attest(
     config: &NotaryConfig,
     url: &str,
     presentation_path: &str,
-) -> Result<Option<String>, Error> {
+    progress: &mut dyn FnMut(&str),
+) -> Result<Notarized, Error> {
     let target = plugins::target(url)?;
 
-    let (attestation, secrets, session_id) = notarize(config, &target).await?;
+    let (attestation, secrets, session_id) = notarize(config, &target, progress).await?;
 
     let presentation = present(&attestation, &secrets)?;
     let presentation_bytes = bincode::serialize(&presentation)?;
     tokio::fs::write(presentation_path, &presentation_bytes).await?;
 
     let verified = verify_presentation(presentation)?;
-    match plugins::profile(&verified.session()) {
+    let record = match verified.profile() {
         Some(Ok(profile)) => {
             let record = Record {
                 url,
@@ -78,23 +86,16 @@ pub async fn attest(
                 profile: &profile,
                 presentation: &presentation_bytes,
             };
-            Ok(Some(record.store().await?))
+            Ok(record.store().await?)
         }
-        Some(Err(err)) => {
-            eprintln!("No attestation record stored: {err}");
-            Ok(None)
-        }
-        None => {
-            eprintln!(
-                "No attestation record stored: {} is not a known profile.",
-                verified.server_name
-            );
-            Ok(None)
-        }
-    }
+        Some(Err(err)) => Err(err.to_string()),
+        None => Err(format!("{} is not a known profile.", verified.server_name)),
+    };
+
+    Ok(Notarized { record })
 }
 
-/// A notarization stored in `<DIR>/<aiwot>-<platform>-<user>.md`.
+/// A notarization stored in `<DIR>/<k5>-<platform>-<user>.md`.
 struct Record<'a> {
     url: &'a str,
     config: &'a NotaryConfig,
@@ -107,12 +108,8 @@ struct Record<'a> {
 impl Record<'_> {
     /// Writes the record, returning its path.
     async fn store(&self) -> Result<String, Error> {
-        let Profile {
-            platform,
-            user,
-            aiwot,
-        } = self.profile;
-        let file_name = format!("{aiwot}-{platform}-{user}.md").replace(['/', '\\'], "_");
+        let Profile { platform, user, k5 } = self.profile;
+        let file_name = format!("{k5}-{platform}-{user}.md").replace(['/', '\\'], "_");
         let path = format!("{DIR}/{file_name}");
 
         tokio::fs::create_dir_all(DIR).await?;
@@ -218,6 +215,7 @@ pub fn verify(record: &str, notary_key: &str) -> Result<Verified, Error> {
 async fn notarize(
     config: &NotaryConfig,
     target: &Target,
+    progress: &mut dyn FnMut(&str),
 ) -> Result<(Attestation, Secrets, String), Error> {
     let notary_client = NotaryClient::builder()
         .host(config.host.clone())
@@ -230,10 +228,10 @@ async fn notarize(
         .max_recv_data(config.max_recv)
         .build()?;
 
-    println!(
+    progress(&format!(
         "Requesting notarization from {}:{}",
         config.host, config.port
-    );
+    ));
 
     let Accepted {
         io: notary_connection,
@@ -243,7 +241,7 @@ async fn notarize(
         .request_notarization(notarization_request)
         .await?;
 
-    println!("Notarization session accepted: {session_id}");
+    progress(&format!("Notarization session accepted: {session_id}"));
 
     let prover_config = ProverConfig::builder()
         .server_name(target.host.as_str())
@@ -287,10 +285,10 @@ async fn notarize(
         .header("User-Agent", USER_AGENT)
         .body(Empty::<Bytes>::new())?;
 
-    println!(
+    progress(&format!(
         "Starting an MPC TLS connection with {}, requesting {}",
         target.host, target.path
-    );
+    ));
 
     let size_hint = |err: &dyn std::fmt::Display| {
         format!(
@@ -307,7 +305,10 @@ async fn notarize(
         .await
         .map_err(|e| size_hint(&e))?;
 
-    println!("Got a response from the server: {}", response.status());
+    progress(&format!(
+        "Got a response from the server: {}",
+        response.status()
+    ));
 
     if !response.status().is_success() {
         return Err(format!("unexpected status: {}", response.status()).into());
@@ -334,7 +335,7 @@ async fn notarize(
     #[allow(deprecated)]
     let (attestation, secrets) = prover.notarize(&request_config).await?;
 
-    println!("Notarization complete!");
+    progress("Notarization complete!");
 
     Ok((attestation, secrets, session_id))
 }
@@ -392,6 +393,11 @@ impl Verified {
             sent: &self.sent,
             recv: &self.recv,
         }
+    }
+
+    /// The profile proven by the session, or `None` if no plugin handles it.
+    pub fn profile(&self) -> Option<Result<Profile, Error>> {
+        plugins::profile(&self.session())
     }
 }
 

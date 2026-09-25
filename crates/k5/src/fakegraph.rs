@@ -7,7 +7,7 @@
 // formation (friends of friends, for clustering), with mutual keysigns as in
 // key signing parties. Each identity keysigns between 1 and
 // [`MAX_CONNECTIONS`] others, and every identity is reachable from the local
-// aiwot, which keysigns the first [`ROOTS`] identities. The keysign
+// k5, which keysigns the first [`ROOTS`] identities. The keysign
 // attestations are stored in
 // the attestations directory, so they pass the web of trust of
 // `attest merge`, together with a self attestation (`me`) of each identity,
@@ -48,7 +48,7 @@ pub const DEFAULT_SEED: u64 = 0xdeadcafe;
 
 /// Maximum number of identities an identity keysigns.
 const MAX_CONNECTIONS: usize = 10;
-/// Number of identities keysigned by the local aiwot. They keysign each
+/// Number of identities keysigned by the local k5. They keysign each
 /// other, as the initial core of the graph.
 const ROOTS: usize = 3;
 /// Probability that a further link of a newcomer goes to a friend of its
@@ -85,7 +85,7 @@ pub struct Identity {
     pub keys: Keys,
 }
 
-/// A keysign of the graph: `signer` (an identity, or the local aiwot if
+/// A keysign of the graph: `signer` (an identity, or the local k5 if
 /// `None`) keysigns identity `subject`.
 struct Edge {
     signer: Option<usize>,
@@ -188,7 +188,7 @@ pub async fn run(me: &Keys, n: usize, seed: u64) -> Result<Summary, Error> {
     let records = parallel_map(&edges, |edge| {
         let signer = edge.signer.map_or(me, |signer| &identities[signer].keys);
         let subject = &identities[edge.subject];
-        keysignparty::create(signer, &subject.keys.aiwot(), &subject.name, true)
+        keysignparty::create(signer, &subject.keys.k5(), &subject.name, true)
             .map_err(|e| e.to_string())
     });
 
@@ -206,7 +206,7 @@ pub async fn run(me: &Keys, n: usize, seed: u64) -> Result<Summary, Error> {
         me::create(&identity.keys, true).map_err(|e| e.to_string())
     });
     for (identity, record) in identities.iter().zip(me_records) {
-        tokio::fs::write(me::path(&identity.keys.aiwot()), record?).await?;
+        tokio::fs::write(me::path(&identity.keys.k5()), record?).await?;
     }
 
     // Fake profile attestations.
@@ -266,7 +266,7 @@ pub async fn run(me: &Keys, n: usize, seed: u64) -> Result<Summary, Error> {
 /// and fake profile attestation is valid, fake, and as expected; every
 /// identity keysigns between 1 and [`MAX_CONNECTIONS`] others and has at least
 /// one fake profile, at most one per platform; and every identity is on a
-/// trust path from the local aiwot.
+/// trust path from the local k5.
 async fn audit(
     me: &Keys,
     identities: &[Identity],
@@ -301,10 +301,10 @@ async fn audit(
 
         let signer = edge
             .signer
-            .map_or_else(|| me.aiwot(), |signer| identities[signer].keys.aiwot());
+            .map_or_else(|| me.k5(), |signer| identities[signer].keys.k5());
         let subject = &identities[edge.subject];
         if keysign.signer != signer
-            || keysign.subject != subject.keys.aiwot()
+            || keysign.subject != subject.keys.k5()
             || keysign.name != subject.name
         {
             return Err(format!("{path}: unexpected keysign").into());
@@ -325,7 +325,7 @@ async fn audit(
 
     let mut me_records = Vec::with_capacity(identities.len());
     for identity in identities {
-        let path = me::path(&identity.keys.aiwot());
+        let path = me::path(&identity.keys.k5());
         me_records.push((path.clone(), tokio::fs::read_to_string(&path).await?));
     }
     let verified = parallel_map(&me_records, |(path, record)| {
@@ -336,7 +336,7 @@ async fn audit(
     });
     for (identity, me) in identities.iter().zip(verified) {
         let me = me?;
-        if me.aiwot != identity.keys.aiwot()
+        if me.k5 != identity.keys.k5()
             || me.encryption_fingerprint()
                 != Some(identity.keys.encryption_subkey()?.fingerprint().to_string())
         {
@@ -364,7 +364,7 @@ async fn audit(
     for (&(index, platform, user), fake) in fakes.iter().zip(verified) {
         let fake = fake?;
         let identity = &identities[index];
-        if fake.aiwot != identity.keys.aiwot() || fake.platform != platform || fake.user != user {
+        if fake.k5 != identity.keys.k5() || fake.platform != platform || fake.user != user {
             return Err(format!(
                 "unexpected fake {platform} attestation of {}",
                 identity.name
@@ -379,10 +379,10 @@ async fn audit(
         }
     }
 
-    let trusted = export::trusted(&me.aiwot(), attestations.iter());
+    let trusted = export::trusted(&me.k5(), attestations.iter());
     for identity in identities {
-        if !trusted.contains(&identity.keys.aiwot()) {
-            return Err(format!("{} is not reachable from your aiwot", identity.name).into());
+        if !trusted.contains(&identity.keys.k5()) {
+            return Err(format!("{} is not reachable from your k5", identity.name).into());
         }
     }
 
@@ -393,7 +393,7 @@ async fn audit(
 fn check_identity(identity: &Identity) -> Result<(), Error> {
     let path = identity.path.display();
     let loaded = key::load(&identity.path)?;
-    if loaded.aiwot() != identity.keys.aiwot()
+    if loaded.k5() != identity.keys.k5()
         || loaded.encryption_subkey()?.fingerprint()
             != identity.keys.encryption_subkey()?.fingerprint()
     {
@@ -604,7 +604,7 @@ impl Graph {
 /// 32 bytes derived from the seed for `label` and `index`.
 fn derive(seed: u64, label: &str, index: u64) -> [u8; 32] {
     let mut hasher = Sha256::new();
-    hasher.update(b"aiwot fakegraph");
+    hasher.update(b"k5 fakegraph");
     hasher.update(seed.to_be_bytes());
     hasher.update(label.as_bytes());
     hasher.update([0]);
@@ -668,8 +668,8 @@ mod tests {
         assert_eq!(graph_of(1), graph_of(1));
         assert_ne!(graph_of(1), graph_of(2));
 
-        assert_eq!(derive_keys(7, 3).aiwot(), derive_keys(7, 3).aiwot());
-        assert_ne!(derive_keys(7, 3).aiwot(), derive_keys(7, 4).aiwot());
+        assert_eq!(derive_keys(7, 3).k5(), derive_keys(7, 3).k5());
+        assert_ne!(derive_keys(7, 3).k5(), derive_keys(7, 4).k5());
     }
 
     #[test]

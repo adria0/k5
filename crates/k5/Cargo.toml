@@ -1,7 +1,7 @@
 [package]
 edition = "2021"
-name = "aiwot"
-description = "Notarize and verify aiwot profiles with TLSNotary, and sign messages with an OpenPGP post-quantum key"
+name = "k5"
+description = "Notarize and verify k5 profiles with TLSNotary, and sign messages with an OpenPGP post-quantum key"
 publish = false
 version = "0.1.0"
 
@@ -9,6 +9,9 @@ version = "0.1.0"
 workspace = true
 
 [features]
+default = ["gui"]
+# `k5 gui`: the Slint desktop interface.
+gui = ["dep:slint", "dep:slint-build", "dep:arboard"]
 zkemail = ["dep:plonky2-zkemail"]
 
 [dependencies]
@@ -44,3 +47,12 @@ tokio = { workspace = true, features = ["rt", "rt-multi-thread", "macros", "net"
 tokio-util = { workspace = true, features = ["compat"] }
 toml = { workspace = true }
 tracing-subscriber = { workspace = true }
+slint = { version = "1.18", optional = true }
+arboard = { version = "3.6", optional = true }
+
+[dev-dependencies]
+# Offscreen rendering, for the window snapshot test in `gui`.
+slint = { version = "1.18", features = ["renderer-software"] }
+
+[build-dependencies]
+slint-build = { version = "1.18", optional = true }

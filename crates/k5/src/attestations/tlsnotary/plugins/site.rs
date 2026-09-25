@@ -1,11 +1,11 @@
 // Website plugin.
 //
-// `https://<domain>/aiwot.txt` on a domain without subdomain, e.g.
-// `https://example.com/aiwot.txt`.
+// `https://<domain>/k5.txt` on a domain without subdomain, e.g.
+// `https://example.com/k5.txt`.
 
-use super::{find_aiwot, Error, Plugin, Profile, Session};
+use super::{find_k5, Error, Plugin, Profile, Session};
 
-const PATH: &str = "/aiwot.txt";
+const PATH: &str = "/k5.txt";
 
 pub struct Site;
 
@@ -15,13 +15,12 @@ impl Plugin for Site {
     }
 
     fn profile(&self, session: &Session) -> Result<Profile, Error> {
-        let aiwot =
-            find_aiwot(session.response_body()?).ok_or("aiwot.txt has no `aiwot:` value")?;
+        let k5 = find_k5(session.response_body()?).ok_or("k5.txt has no `k5:` value")?;
 
         Ok(Profile {
             platform: "site",
             user: session.server_name.to_string(),
-            aiwot: aiwot.to_string(),
+            k5: k5.to_string(),
         })
     }
 }
@@ -34,8 +33,8 @@ mod tests {
     fn test_profile() {
         let session = Session {
             server_name: "example.com",
-            sent: "GET /aiwot.txt HTTP/1.1\r\nhost: example.com\r\n\r\n",
-            recv: "HTTP/1.1 200 OK\r\nContent-Length: 11\r\n\r\naiwot:ab12\n",
+            sent: "GET /k5.txt HTTP/1.1\r\nhost: example.com\r\n\r\n",
+            recv: "HTTP/1.1 200 OK\r\nContent-Length: 11\r\n\r\nk5:ab12\n",
         };
 
         assert!(Site.matches(&session));
@@ -44,12 +43,12 @@ mod tests {
             ..session
         }));
         assert!(!Site.matches(&Session {
-            sent: "GET /other/aiwot.txt HTTP/1.1\r\n\r\n",
+            sent: "GET /other/k5.txt HTTP/1.1\r\n\r\n",
             ..session
         }));
         assert_eq!(
             Site.profile(&session).unwrap().to_string(),
-            "site/example.com/aiwot:ab12"
+            "site/example.com/k5:ab12"
         );
     }
 }

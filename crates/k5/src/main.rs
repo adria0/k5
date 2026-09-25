@@ -1,30 +1,22 @@
-// aiwot command line: notarize and keysign attestations of aiwot profiles,
-// sign messages with the OpenPGP post-quantum key, and verify both.
-//
-// Attestations live in `attestations`: TLSNotary (with its platform plugins
-// for X, GitHub and websites) and key sign party.
+// k5 command line: a console front end of the k5 API (`k5::api`),
+// which does the work. This file only parses arguments, reads and writes the
+// files named on the command line, and prints the results.
 
-mod attestations;
-mod fakegraph;
-mod graph;
-mod key;
-mod message;
-mod parallel;
-mod signcrypt;
+#[cfg(feature = "gui")]
+mod gui;
 
 use clap::{Args, Parser, Subcommand};
 
-use attestations::{keysignparty, tlsnotary, Attested};
-use key::Keys;
-
-const DEFAULT_NOTARY_KEY: &str =
-    "02f37514ced12c58460456a07b42042894f413ff63f9a3f0824fbe86e6c7da6764";
+use k5::api::{
+    self, Attested, Listing, NotaryConfig, Outcome, ProfileAttestation, Verification,
+    ATTESTATIONS_DIR, DEFAULT_NOTARY_KEY, K5,
+};
 
 #[derive(Parser, Debug)]
 #[command(version, about = "Notarize profiles with a remote TLSNotary server, and sign and verify messages with an OpenPGP post-quantum key", long_about = None)]
 struct Cli {
     /// Configuration file with the keys, created by `init`.
-    #[clap(long, global = true, default_value = "aiwot.toml")]
+    #[clap(long, global = true, default_value = "k5.toml")]
     config: std::path::PathBuf,
     #[command(subcommand)]
     command: Command,
@@ -36,7 +28,7 @@ enum Command {
     /// signing key with a MlKem768X25519 encryption subkey (post-quantum
     /// composite algorithms). Fails if the file already exists.
     Init,
-    /// Print your aiwot.
+    /// Print your k5.
     Me,
     /// Create, list, search, audit, export and merge attestations.
     Attest(AttestArgs),
@@ -44,16 +36,30 @@ enum Command {
     Msg(MsgArgs),
     /// Generate a deterministic fake social graph: identities in `db/ids/`,
     /// keysigning each other like a human social network (all reachable from
-    /// your aiwot), with self attestations and fake X, GitHub and website
+    /// your k5), with self attestations and fake X, GitHub and website
     /// attestations, all stored in `db/attestations/` and marked as fake.
     /// Audits the result.
     Fakegraph(FakegraphArgs),
     /// Write a Graphviz digraph of the verified attestations: keysigns
-    /// between aiwots, and the social profiles of each aiwot.
+    /// between k5s, and the social profiles of each k5.
     Makedot(MakedotArgs),
     #[cfg(feature = "zkemail")]
     /// Generate a Plonky2 proof for a DKIM-signed email.
     Zkemail(ZkemailArgs),
+    #[cfg(feature = "gui")]
+    /// Open the terminal-style window: search the attestations, inspect the
+    /// dossier of an identity, and send it a signed or signcrypted message
+    /// (copied to the clipboard).
+    Gui(GuiArgs),
+}
+
+#[cfg(feature = "gui")]
+#[derive(Args, Debug)]
+struct GuiArgs {
+    /// Expected notary public key (compressed secp256k1, hex). TLSNotary
+    /// attestations signed by a different key are ignored.
+    #[clap(long, default_value = DEFAULT_NOTARY_KEY)]
+    notary_key: String,
 }
 
 #[cfg(feature = "zkemail")]
@@ -99,7 +105,7 @@ enum MsgCommand {
     /// Sign a message with the MlDsa65Ed25519 signing key, printing the
     /// OpenPGP signed message and writing it to a file.
     Sign(SignArgs),
-    /// Sign a message and encrypt it to an aiwot, using the MlKem768X25519
+    /// Sign a message and encrypt it to a k5, using the MlKem768X25519
     /// encryption subkey of its self attestation in `db/attestations/`.
     /// Prints the signcrypted OpenPGP message and writes it to a file.
     Signcrypt(SigncryptArgs),
@@ -122,7 +128,7 @@ enum AttestCommand {
     /// `db/attestations/` if a plugin recognizes the profile.
     New(NotarizeArgs),
     /// Verify all the attestations in `db/attestations/` and print them as a
-    /// tree of aiwots, with a subtree of attributes per attestation.
+    /// tree of k5s, with a subtree of attributes per attestation.
     List(ListArgs),
     /// Verify all the attestations in `db/attestations/` and print, as
     /// `list` does, those whose user (handle, domain, name...) matches a
@@ -138,9 +144,9 @@ enum AttestCommand {
     /// written by `attest export` that are on your web of trust, after
     /// verifying its signature: first the keysign attestations whose signer
     /// is reachable from you through keysigns, then the other attestations
-    /// about reachable aiwots.
+    /// about reachable k5s.
     Merge(MergeArgs),
-    /// Attest, key signing party style, that you know the owner of an aiwot,
+    /// Attest, key signing party style, that you know the owner of a k5,
     /// signing it with your key. The attestation is stored in
     /// `db/attestations/`.
     #[command(alias = "keysignparty")]
@@ -193,16 +199,16 @@ struct MergeArgs {
 
 #[derive(Args, Debug)]
 struct KeysignArgs {
-    /// The aiwot you attest, with or without the `aiwot:` prefix.
-    aiwot: String,
+    /// The k5 you attest, with or without the `k5:` prefix.
+    k5: String,
     /// The name of its owner.
     name: String,
 }
 
 #[derive(Args, Debug)]
 struct SigncryptArgs {
-    /// The recipient aiwot, with or without the `aiwot:` prefix.
-    aiwot: String,
+    /// The recipient k5, with or without the `k5:` prefix.
+    k5: String,
     /// Message to sign and encrypt.
     msg: String,
     /// Output file.
@@ -274,53 +280,65 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         }
     }
 
-    let keys = match cli.command {
-        Command::Init => key::create(&cli.config)?,
-        _ => key::load(&cli.config)?,
+    let k5 = match cli.command {
+        Command::Init => {
+            let k5 = K5::init(&cli.config)?;
+            eprintln!(
+                "Created OpenPGP key (MlDsa65Ed25519 signing key with a MlKem768X25519 \
+                 encryption subkey) in {}",
+                cli.config.display()
+            );
+            k5
+        }
+        _ => K5::open(&cli.config)?,
     };
-    if let Command::Init = cli.command {
-        eprintln!(
-            "Created OpenPGP key (MlDsa65Ed25519 signing key with a MlKem768X25519 encryption \
-             subkey) in {}",
-            cli.config.display()
-        );
-    }
-    if let Some(path) = attestations::me::ensure(&keys).await? {
-        eprintln!("Created self attestation {path}");
+    if let Some(created) = k5.ensure_self_attestation().await? {
+        if let Some(reason) = created.replaced {
+            eprintln!("Replacing self attestation {}: {reason}", created.path);
+        }
+        eprintln!("Created self attestation {}", created.path);
     }
 
     match cli.command {
         Command::Init => Ok(()),
         Command::Me => {
-            println!("{}", keys.aiwot());
+            println!("{}", k5.k5());
             Ok(())
         }
         Command::Attest(AttestArgs { command }) => match command {
-            AttestCommand::New(args) => run_notarize(&args).await,
-            AttestCommand::List(args) => run_list(&args).await,
-            AttestCommand::Search(args) => run_search(&args).await,
-            AttestCommand::Audit(args) => run_audit(&args).await,
-            AttestCommand::Export(args) => run_export(&args, &keys).await,
-            AttestCommand::Merge(args) => run_merge(&args, &keys.aiwot()).await,
-            AttestCommand::Keysign(args) => run_keysign(&args, &keys).await,
+            AttestCommand::New(args) => run_notarize(&args, &k5).await,
+            AttestCommand::List(args) => run_list(&k5.with_notary_key(&args.notary_key)).await,
+            AttestCommand::Search(args) => {
+                run_search(&args, &k5.with_notary_key(&args.notary_key)).await
+            }
+            AttestCommand::Audit(args) => run_audit(&k5.with_notary_key(&args.notary_key)).await,
+            AttestCommand::Export(args) => {
+                run_export(&args, &k5.with_notary_key(&args.notary_key)).await
+            }
+            AttestCommand::Merge(args) => {
+                run_merge(&args, &k5.with_notary_key(&args.notary_key)).await
+            }
+            AttestCommand::Keysign(args) => run_keysign(&args, &k5).await,
         },
-        Command::Makedot(args) => run_makedot(&args, &keys.aiwot()).await,
-        Command::Fakegraph(args) => run_fakegraph(&args, &keys).await,
+        Command::Makedot(args) => run_makedot(&args, &k5.with_notary_key(&args.notary_key)).await,
+        Command::Fakegraph(args) => run_fakegraph(&args, &k5).await,
         Command::Msg(MsgArgs { command }) => match command {
-            MsgCommand::Sign(args) => run_sign(&args, &keys).await,
-            MsgCommand::Signcrypt(args) => run_signcrypt(&args, &keys).await,
-            MsgCommand::Verify(args) => run_verify(&args, &keys).await,
+            MsgCommand::Sign(args) => run_sign(&args, &k5).await,
+            MsgCommand::Signcrypt(args) => run_signcrypt(&args, &k5).await,
+            MsgCommand::Verify(args) => {
+                run_verify(&args, &k5.with_notary_key(&args.notary_key)).await
+            }
         },
+        #[cfg(feature = "gui")]
+        Command::Gui(args) => gui::run(k5.with_notary_key(&args.notary_key)),
         #[cfg(feature = "zkemail")]
-        Command::Zkemail(_) => unreachable!("zkemail is handled before loading aiwot keys"),
+        Command::Zkemail(_) => unreachable!("zkemail is handled before loading k5 keys"),
     }
 }
 
-/// Generates a proof synchronously because proving is CPU-bound and this
-/// command performs no concurrent asynchronous work.
 #[cfg(feature = "zkemail")]
 fn run_zkemail(args: &ZkemailArgs) -> Result<(), Box<dyn std::error::Error>> {
-    let proof = plonky2_zkemail::eml::prove(&args.eml, &args.dkim)?;
+    let proof = api::zkemail(&args.eml, &args.dkim)?;
     std::fs::write(&args.output, &proof.bytes)?;
     println!(
         "Generated {}-byte proof for d={}, s={} ({} gate rows, {} padded rows): {}",
@@ -334,8 +352,8 @@ fn run_zkemail(args: &ZkemailArgs) -> Result<(), Box<dyn std::error::Error>> {
     Ok(())
 }
 
-async fn run_notarize(args: &NotarizeArgs) -> Result<(), Box<dyn std::error::Error>> {
-    let config = tlsnotary::NotaryConfig {
+async fn run_notarize(args: &NotarizeArgs, k5: &K5) -> Result<(), Box<dyn std::error::Error>> {
+    let config = NotaryConfig {
         host: args.notary_host.clone(),
         port: args.notary_port,
         tls: args.notary_tls,
@@ -343,57 +361,67 @@ async fn run_notarize(args: &NotarizeArgs) -> Result<(), Box<dyn std::error::Err
         max_recv: args.max_recv,
     };
 
-    if let Some(path) = tlsnotary::attest(&config, &args.url, &args.out).await? {
-        println!("{path}");
+    let notarized = k5
+        .notarize(&config, &args.url, &args.out, &mut |step| {
+            println!("{step}")
+        })
+        .await?;
+    match notarized.record {
+        Ok(path) => println!("{path}"),
+        Err(reason) => eprintln!("No attestation record stored: {reason}"),
     }
 
     Ok(())
 }
 
-async fn run_list(args: &ListArgs) -> Result<(), Box<dyn std::error::Error>> {
-    let attestations = attestations::list(&args.notary_key).await?;
-    if attestations.is_empty() {
-        println!("No attestations in {}/", attestations::DIR);
+/// Reports the invalid records skipped by a listing.
+fn print_invalid(listing: &Listing) {
+    for invalid in &listing.invalid {
+        eprintln!(
+            "Ignoring invalid attestation {ATTESTATIONS_DIR}/{}: {}",
+            invalid.file, invalid.error
+        );
     }
-    print_tree(&attestations);
+}
+
+async fn run_list(k5: &K5) -> Result<(), Box<dyn std::error::Error>> {
+    let listing = k5.list().await?;
+    print_invalid(&listing);
+    if listing.attestations.is_empty() {
+        println!("No attestations in {ATTESTATIONS_DIR}/");
+    }
+    print_tree(&listing.attestations);
 
     Ok(())
 }
 
-async fn run_search(args: &SearchArgs) -> Result<(), Box<dyn std::error::Error>> {
-    let pattern = regex::Regex::new(&args.pattern)
-        .map_err(|e| format!("invalid regex `{}`: {e}", args.pattern))?;
-
-    let found: Vec<_> = attestations::list(&args.notary_key)
-        .await?
-        .into_iter()
-        .filter(|attestation| pattern.is_match(&attestation.profile.user))
-        .collect();
-    if found.is_empty() {
+async fn run_search(args: &SearchArgs, k5: &K5) -> Result<(), Box<dyn std::error::Error>> {
+    let found = k5.search(&args.pattern).await?;
+    print_invalid(&found);
+    if found.attestations.is_empty() {
         println!(
-            "No attestations in {}/ with a user matching `{}`",
-            attestations::DIR,
+            "No attestations in {ATTESTATIONS_DIR}/ with a user matching `{}`",
             args.pattern
         );
     }
-    print_tree(&found);
+    print_tree(&found.attestations);
 
     Ok(())
 }
 
-/// Prints attestations sorted by aiwot as a tree of aiwots, with a subtree
+/// Prints attestations sorted by k5 as a tree of k5s, with a subtree
 /// of attributes per attestation.
-fn print_tree(attestations: &[attestations::ProfileAttestation]) {
-    let mut groups: Vec<(&str, Vec<&attestations::ProfileAttestation>)> = Vec::new();
+fn print_tree(attestations: &[ProfileAttestation]) {
+    let mut groups: Vec<(&str, Vec<&ProfileAttestation>)> = Vec::new();
     for attestation in attestations {
         match groups.last_mut() {
-            Some((aiwot, group)) if *aiwot == attestation.profile.aiwot => group.push(attestation),
-            _ => groups.push((&attestation.profile.aiwot, vec![attestation])),
+            Some((k5, group)) if *k5 == attestation.profile.k5 => group.push(attestation),
+            _ => groups.push((&attestation.profile.k5, vec![attestation])),
         }
     }
 
-    for (aiwot, group) in groups {
-        println!("aiwot:{aiwot}");
+    for (k5, group) in groups {
+        println!("k5:{k5}");
         for (idx, attestation) in group.iter().enumerate() {
             let last = idx + 1 == group.len();
             println!(
@@ -418,8 +446,8 @@ fn print_tree(attestations: &[attestations::ProfileAttestation]) {
     }
 }
 
-async fn run_audit(args: &ListArgs) -> Result<(), Box<dyn std::error::Error>> {
-    let checked = attestations::audit(&args.notary_key).await?;
+async fn run_audit(k5: &K5) -> Result<(), Box<dyn std::error::Error>> {
+    let checked = k5.audit().await?;
 
     let mut invalid = 0;
     for checked in &checked {
@@ -433,9 +461,8 @@ async fn run_audit(args: &ListArgs) -> Result<(), Box<dyn std::error::Error>> {
     }
 
     println!(
-        "{} files in {}/: {} valid, {invalid} invalid",
+        "{} files in {ATTESTATIONS_DIR}/: {} valid, {invalid} invalid",
         checked.len(),
-        attestations::DIR,
         checked.len() - invalid
     );
     if invalid > 0 {
@@ -445,32 +472,32 @@ async fn run_audit(args: &ListArgs) -> Result<(), Box<dyn std::error::Error>> {
     Ok(())
 }
 
-async fn run_export(args: &ExportArgs, keys: &Keys) -> Result<(), Box<dyn std::error::Error>> {
-    let (markdown, count) = attestations::export::create(keys, &args.notary_key).await?;
+async fn run_export(args: &ExportArgs, k5: &K5) -> Result<(), Box<dyn std::error::Error>> {
+    let export = k5.export().await?;
+    for skipped in &export.skipped {
+        eprintln!(
+            "Not exporting invalid attestation {ATTESTATIONS_DIR}/{}: {}",
+            skipped.file, skipped.error
+        );
+    }
 
-    // Check the output before handing it out.
-    message::verify(&markdown, &attestations::keyring().await?)?;
-
-    tokio::fs::write(&args.out, &markdown).await?;
-    eprintln!("Exported {count} attestations");
+    tokio::fs::write(&args.out, &export.markdown).await?;
+    eprintln!("Exported {} attestations", export.count);
     println!("{}", args.out);
 
     Ok(())
 }
 
-async fn run_merge(args: &MergeArgs, me: &str) -> Result<(), Box<dyn std::error::Error>> {
-    use attestations::export::Outcome;
-
+async fn run_merge(args: &MergeArgs, k5: &K5) -> Result<(), Box<dyn std::error::Error>> {
     let markdown = tokio::fs::read_to_string(&args.file).await?;
-    let (signer, merged) =
-        attestations::export::merge(&markdown, me, &args.notary_key, args.force).await?;
+    let report = k5.merge(&markdown, args.force).await?;
 
-    println!("Valid signature from aiwot:{signer}");
+    println!("Valid signature from k5:{}", report.signer);
 
     let mut invalid = 0;
     let mut untrusted = 0;
     let mut stored = 0;
-    for merged in &merged {
+    for merged in &report.merged {
         let file = &merged.file;
         match &merged.outcome {
             Outcome::Added(attestation) => {
@@ -487,7 +514,7 @@ async fn run_merge(args: &MergeArgs, me: &str) -> Result<(), Box<dyn std::error:
             ),
             Outcome::Untrusted(attestation) => {
                 untrusted += 1;
-                println!("UNTRUSTED  {file}  {attestation}: no trust path from your aiwot");
+                println!("UNTRUSTED  {file}  {attestation}: no trust path from your k5");
             }
             Outcome::Invalid(e) => {
                 invalid += 1;
@@ -498,7 +525,7 @@ async fn run_merge(args: &MergeArgs, me: &str) -> Result<(), Box<dyn std::error:
 
     println!(
         "{} attestations in {}: {stored} merged, {untrusted} untrusted, {invalid} invalid",
-        merged.len(),
+        report.merged.len(),
         args.file
     );
     if invalid > 0 {
@@ -508,27 +535,24 @@ async fn run_merge(args: &MergeArgs, me: &str) -> Result<(), Box<dyn std::error:
     Ok(())
 }
 
-async fn run_fakegraph(
-    args: &FakegraphArgs,
-    keys: &Keys,
-) -> Result<(), Box<dyn std::error::Error>> {
+async fn run_fakegraph(args: &FakegraphArgs, k5: &K5) -> Result<(), Box<dyn std::error::Error>> {
     let seed = match &args.seed {
-        Some(seed) => fakegraph::parse_seed(seed)?,
-        None => fakegraph::DEFAULT_SEED,
+        Some(seed) => api::parse_seed(seed)?,
+        None => api::DEFAULT_SEED,
     };
-    let summary = fakegraph::run(keys, args.n, seed).await?;
+    let summary = k5.fakegraph(args.n, seed).await?;
 
     println!(
         "Generated {} identities in {}/ from seed {seed:#x} ({} already existed)",
         summary.identities,
-        fakegraph::DIR,
+        api::IDS_DIR,
         summary.existing
     );
     println!(
-        "Generated {} keysign attestations in {}/: yours of the first {} identities, and \
-         {} to {} per identity ({:.1} on average), up to {} keysigning the same identity",
+        "Generated {} keysign attestations in {ATTESTATIONS_DIR}/: yours of the first {} \
+         identities, and {} to {} per identity ({:.1} on average), up to {} keysigning the \
+         same identity",
         summary.keysigns,
-        attestations::DIR,
         summary.roots,
         summary.min_connections,
         summary.max_connections,
@@ -536,9 +560,9 @@ async fn run_fakegraph(
         summary.max_keysigned_by
     );
     println!(
-        "Generated {} self attestations in {}/, with the KEM keys of the identities",
+        "Generated {} self attestations in {ATTESTATIONS_DIR}/, with the KEM keys of the \
+         identities",
         summary.me_records,
-        attestations::DIR
     );
     let per_platform: Vec<String> = summary
         .fakes_per_platform
@@ -546,47 +570,39 @@ async fn run_fakegraph(
         .map(|(platform, count)| format!("{platform}: {count}"))
         .collect();
     println!(
-        "Generated {} fake profile attestations in {}/ ({})",
+        "Generated {} fake profile attestations in {ATTESTATIONS_DIR}/ ({})",
         summary
             .fakes_per_platform
             .iter()
             .map(|(_, count)| count)
             .sum::<usize>(),
-        attestations::DIR,
         per_platform.join(", ")
     );
     println!("All generated attestations are marked as fake");
     println!(
         "Audit OK: all identities match the seed, all attestations verify and are fake, and \
-         all identities are reachable from aiwot:{}",
-        keys.aiwot()
+         all identities are reachable from k5:{}",
+        k5.k5()
     );
 
     Ok(())
 }
 
-async fn run_makedot(args: &MakedotArgs, me: &str) -> Result<(), Box<dyn std::error::Error>> {
-    let attestations = attestations::list(&args.notary_key).await?;
-    let dot = graph::dot(me, &attestations);
+async fn run_makedot(args: &MakedotArgs, k5: &K5) -> Result<(), Box<dyn std::error::Error>> {
+    let graph = k5.graph().await?;
 
-    tokio::fs::write(&args.out, &dot).await?;
+    tokio::fs::write(&args.out, &graph.dot).await?;
     eprintln!(
-        "{} aiwots and {} keysigns, from {} attestations in {}/",
-        dot.lines().filter(|line| line.contains(" [label=")).count(),
-        dot.lines().filter(|line| line.contains(" -> ")).count(),
-        attestations.len(),
-        attestations::DIR
+        "{} k5s and {} keysigns, from {} attestations in {ATTESTATIONS_DIR}/",
+        graph.k5s, graph.keysigns, graph.attestations,
     );
     println!("{}", args.out);
 
     Ok(())
 }
 
-async fn run_sign(args: &SignArgs, keys: &Keys) -> Result<(), Box<dyn std::error::Error>> {
-    let armored = message::sign(&keys.secret, &args.msg)?;
-
-    // Check the output before handing it out.
-    message::verify(&armored, &attestations::keyring().await?)?;
+async fn run_sign(args: &SignArgs, k5: &K5) -> Result<(), Box<dyn std::error::Error>> {
+    let armored = k5.sign(&args.msg).await?;
 
     print!("{armored}");
     tokio::fs::write(&args.out, &armored).await?;
@@ -595,119 +611,88 @@ async fn run_sign(args: &SignArgs, keys: &Keys) -> Result<(), Box<dyn std::error
     Ok(())
 }
 
-/// Verifies a signed message and lists the attestations of its signer.
-async fn verify_msg(content: &str, notary_key: &str) -> Result<(), Box<dyn std::error::Error>> {
-    let keyring = attestations::keyring().await?;
-    let signed = message::verify(content, &keyring)?;
-
-    println!("Valid signature from aiwot:{}", signed.from);
-
-    if attestations::export::is_export(&signed.msg) {
-        let checked = attestations::export::verify(&signed.msg, notary_key).await?;
-        println!("Export of {} attestations:", checked.len());
-        for checked in &checked {
-            match &checked.result {
-                Ok(attestation) => println!("OK    {}  {attestation}", checked.file),
-                Err(e) => println!("FAIL  {}  {e}", checked.file),
-            }
-        }
-    }
-
-    print_attested_by(&signed.from, notary_key).await
-}
-
-/// Prints the verified attestations of `aiwot`.
-async fn print_attested_by(
-    aiwot: &str,
-    notary_key: &str,
-) -> Result<(), Box<dyn std::error::Error>> {
-    let attestations = attestations::attested_by(aiwot, notary_key).await?;
-    if attestations.is_empty() {
-        println!("Not attested by any profile in {}/", attestations::DIR);
-    }
-    for attestation in attestations {
-        println!("Attested by {attestation}");
-    }
+async fn run_keysign(args: &KeysignArgs, k5: &K5) -> Result<(), Box<dyn std::error::Error>> {
+    println!("{}", k5.keysign(&args.k5, &args.name).await?);
 
     Ok(())
 }
 
-async fn run_keysign(args: &KeysignArgs, keys: &Keys) -> Result<(), Box<dyn std::error::Error>> {
-    let keyring = attestations::keyring().await?;
-    println!(
-        "{}",
-        keysignparty::attest(keys, &args.aiwot, &args.name, &keyring).await?
+async fn run_signcrypt(args: &SigncryptArgs, k5: &K5) -> Result<(), Box<dyn std::error::Error>> {
+    let sealed = k5.signcrypt(&args.k5, &args.msg).await?;
+
+    print!("{}", sealed.armored);
+    tokio::fs::write(&args.out, &sealed.armored).await?;
+    eprintln!(
+        "Signcrypted message for k5:{} written to {}",
+        sealed.to, args.out
     );
 
     Ok(())
 }
 
-async fn run_verify(args: &VerifyArgs, keys: &Keys) -> Result<(), Box<dyn std::error::Error>> {
+async fn run_verify(args: &VerifyArgs, k5: &K5) -> Result<(), Box<dyn std::error::Error>> {
     let content = tokio::fs::read_to_string(&args.file).await?;
 
-    if content.starts_with("-----BEGIN PGP SIGNED MESSAGE-----") {
-        verify_msg(&content, &args.notary_key).await
-    } else if content.starts_with("-----BEGIN PGP MESSAGE-----") {
-        verify_signcrypted(&content, keys, &args.notary_key).await
-    } else if content.starts_with("# info") {
-        verify_attestation(&content, &args.notary_key).await
-    } else {
-        Err(format!(
-            "{} is neither a signed message, a signcrypted message nor an attestation record \
-             (`# info`)",
-            args.file
-        )
-        .into())
+    match k5
+        .verify(&content)
+        .await
+        .map_err(|e| format!("{}: {e}", args.file))?
+    {
+        Verification::Signed {
+            from,
+            export,
+            attested_by,
+            ..
+        } => {
+            println!("Valid signature from k5:{from}");
+            if let Some(checked) = export {
+                println!("Export of {} attestations:", checked.len());
+                for checked in &checked {
+                    match &checked.result {
+                        Ok(attestation) => println!("OK    {}  {attestation}", checked.file),
+                        Err(e) => println!("FAIL  {}  {e}", checked.file),
+                    }
+                }
+            }
+            print_attested_by(&attested_by);
+        }
+        Verification::Signcrypted {
+            from,
+            msg,
+            attested_by,
+        } => {
+            println!("Decrypted message for k5:{}", k5.k5());
+            println!("Valid signature from k5:{from}");
+            println!("# msg\n{msg}");
+            print_attested_by(&attested_by);
+        }
+        Verification::Attestation(attested) => print_attested(attested)?,
     }
-}
-
-async fn run_signcrypt(
-    args: &SigncryptArgs,
-    keys: &Keys,
-) -> Result<(), Box<dyn std::error::Error>> {
-    let to_key = signcrypt::recipient_encryption_key(&args.aiwot).await?;
-    let to = signcrypt::recipient_aiwot(&args.aiwot);
-    let sealed = signcrypt::seal(keys, &to, &to_key, &args.msg)?;
-
-    print!("{sealed}");
-    tokio::fs::write(&args.out, &sealed).await?;
-    eprintln!("Signcrypted message for aiwot:{to} written to {}", args.out);
 
     Ok(())
 }
 
-/// Decrypts a signcrypted message addressed to us, verifies it and lists the
-/// attestations of its sender.
-async fn verify_signcrypted(
-    content: &str,
-    keys: &Keys,
-    notary_key: &str,
-) -> Result<(), Box<dyn std::error::Error>> {
-    let keyring = attestations::keyring().await?;
-    let opened = signcrypt::open(keys, content, &keyring)?;
-
-    println!("Decrypted message for aiwot:{}", keys.aiwot());
-    println!("Valid signature from aiwot:{}", opened.from);
-    println!("# msg\n{}", opened.msg);
-
-    print_attested_by(&opened.from, notary_key).await
+/// Prints the verified attestations of the author of a message.
+fn print_attested_by(listing: &Listing) {
+    print_invalid(listing);
+    if listing.attestations.is_empty() {
+        println!("Not attested by any profile in {ATTESTATIONS_DIR}/");
+    }
+    for attestation in &listing.attestations {
+        println!("Attested by {attestation}");
+    }
 }
 
-/// Verifies an attestation record and prints its profile (and signer for key
+/// Prints a verified attestation record: its profile (and signer for key
 /// sign party attestations), or the full transcript if no plugin handles a
 /// TLSNotary record.
-async fn verify_attestation(
-    record: &str,
-    notary_key: &str,
-) -> Result<(), Box<dyn std::error::Error>> {
-    let keyring = attestations::keyring().await?;
-    let attested = attestations::verify(record, notary_key, &keyring)?;
+fn print_attested(attested: Attested) -> Result<(), Box<dyn std::error::Error>> {
     let fake = if attested.is_fake() { " [fake]" } else { "" };
     let verified = match attested {
         Attested::Tlsn(verified) => verified,
         Attested::KeySign(keysign) => {
             println!(
-                "{} signed by aiwot:{}{fake}",
+                "{} signed by k5:{}{fake}",
                 keysign.profile(),
                 keysign.signer
             );
@@ -731,7 +716,7 @@ async fn verify_attestation(
         }
     };
 
-    if let Some(profile) = tlsnotary::plugins::profile(&verified.session()) {
+    if let Some(profile) = verified.profile() {
         println!("{}", profile?);
         return Ok(());
     }

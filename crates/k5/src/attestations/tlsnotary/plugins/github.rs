@@ -4,7 +4,7 @@
 // returns 404 if `<user>` does not own the gist, so a 200 response proves the
 // user.
 
-use super::{find_aiwot, Error, Plugin, Profile, Session};
+use super::{find_k5, Error, Plugin, Profile, Session};
 
 const GIST_DOMAIN: &str = "gist.githubusercontent.com";
 
@@ -24,12 +24,12 @@ impl Plugin for Github {
             .filter(|user| !user.is_empty())
             .ok_or_else(|| format!("could not parse gist user from `{path}`"))?;
 
-        let aiwot = find_aiwot(session.response_body()?).ok_or("gist has no `aiwot:` value")?;
+        let k5 = find_k5(session.response_body()?).ok_or("gist has no `k5:` value")?;
 
         Ok(Profile {
             platform: "github",
             user: user.to_string(),
-            aiwot: aiwot.to_string(),
+            k5: k5.to_string(),
         })
     }
 }
@@ -43,13 +43,13 @@ mod tests {
         let session = Session {
             server_name: GIST_DOMAIN,
             sent: "GET /adria0/0123abcd/raw/file.txt HTTP/1.1\r\nhost: gist.githubusercontent.com\r\n\r\n",
-            recv: "HTTP/1.1 200 OK\r\nContent-Length: 11\r\n\r\naiwot:ab12\n",
+            recv: "HTTP/1.1 200 OK\r\nContent-Length: 11\r\n\r\nk5:ab12\n",
         };
 
         assert!(Github.matches(&session));
         assert_eq!(
             Github.profile(&session).unwrap().to_string(),
-            "github/adria0/aiwot:ab12"
+            "github/adria0/k5:ab12"
         );
 
         let not_found = Session {

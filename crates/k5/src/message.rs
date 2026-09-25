@@ -3,7 +3,7 @@
 //
 // A signed message carries no public key: verifying it resolves the signer's
 // public key by the fingerprint in the signature from a [`Keyring`], as a
-// real PGP keyring would. Verifying a message from an aiwot whose self
+// real PGP keyring would. Verifying a message from a k5 whose self
 // attestation has not been fetched into the keyring fails.
 
 use std::collections::HashMap;
@@ -16,12 +16,12 @@ use rand::rngs::OsRng;
 
 pub type Error = Box<dyn std::error::Error>;
 
-/// Public keys of known signers, by aiwot id (OpenPGP fingerprint).
+/// Public keys of known signers, by k5 id (OpenPGP fingerprint).
 pub type Keyring = HashMap<String, SignedPublicKey>;
 
 /// A verified signed message.
 pub struct Verified {
-    /// The aiwot id of the signer.
+    /// The k5 id of the signer.
     pub from: String,
     pub msg: String,
 }
@@ -49,7 +49,7 @@ pub fn verify(armored: &str, keyring: &Keyring) -> Result<Verified, Error> {
 
     let public = keyring
         .get(&from)
-        .ok_or_else(|| format!("unknown signer aiwot:{from}: fetch its self attestation first"))?;
+        .ok_or_else(|| format!("unknown signer k5:{from}: fetch its self attestation first"))?;
     signed.verify(public)?;
 
     // `signed_text` normalizes line endings to CRLF for hashing; every
@@ -66,7 +66,7 @@ mod tests {
     use crate::key::test_keys;
 
     fn keyring_of(keys: &crate::key::Keys) -> Keyring {
-        Keyring::from([(keys.aiwot(), keys.public())])
+        Keyring::from([(keys.k5(), keys.public())])
     }
 
     #[test]
@@ -78,7 +78,7 @@ mod tests {
         assert!(armored.starts_with("-----BEGIN PGP SIGNED MESSAGE-----"));
 
         let verified = verify(&armored, &keyring).unwrap();
-        assert_eq!(verified.from, keys.aiwot());
+        assert_eq!(verified.from, keys.k5());
         assert_eq!(verified.msg, "hello\nworld");
     }
 
@@ -104,7 +104,7 @@ mod tests {
         // wrong keyring entry fails.
         let other = test_keys();
         let mut mixed = Keyring::new();
-        mixed.insert(keys.aiwot(), other.public());
+        mixed.insert(keys.k5(), other.public());
         assert!(verify(&armored, &mixed).is_err());
     }
 }

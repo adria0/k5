@@ -7,7 +7,7 @@
 
 use hyper::Uri;
 
-use super::{find_aiwot, Error, Plugin, Profile, Session, Target};
+use super::{find_k5, Error, Plugin, Profile, Session, Target};
 
 const SYNDICATION_DOMAIN: &str = "cdn.syndication.twimg.com";
 const DOMAINS: &[&str] = &[
@@ -60,13 +60,12 @@ impl Plugin for X {
             .as_str()
             .ok_or("tweet has no user")?;
         let text = tweet["text"].as_str().ok_or("tweet has no text")?;
-        let aiwot =
-            find_aiwot(text).ok_or_else(|| format!("tweet has no `aiwot:` value: {text}"))?;
+        let k5 = find_k5(text).ok_or_else(|| format!("tweet has no `k5:` value: {text}"))?;
 
         Ok(Profile {
             platform: "X",
             user: user.to_string(),
-            aiwot: aiwot.to_string(),
+            k5: k5.to_string(),
         })
     }
 }
@@ -100,14 +99,11 @@ mod tests {
         let session = Session {
             server_name: SYNDICATION_DOMAIN,
             sent: "GET /tweet-result?id=1&token=a HTTP/1.1\r\n\r\n",
-            recv: "HTTP/1.1 200 OK\r\n\r\n{\"text\":\"aiwot:ab12\",\"user\":{\"screen_name\":\"adria0\"}}",
+            recv: "HTTP/1.1 200 OK\r\n\r\n{\"text\":\"k5:ab12\",\"user\":{\"screen_name\":\"adria0\"}}",
         };
 
         assert!(X.matches(&session));
-        assert_eq!(
-            X.profile(&session).unwrap().to_string(),
-            "X/adria0/aiwot:ab12"
-        );
+        assert_eq!(X.profile(&session).unwrap().to_string(), "X/adria0/k5:ab12");
 
         let deleted = Session {
             recv: "HTTP/1.1 200 OK\r\n\r\n{\"__typename\":\"TweetTombstone\",\"tombstone\":{\"text\":{\"text\":\"This Post was deleted by the Post author.\"}}}",

@@ -1,8 +1,8 @@
-// Keys stored in `aiwot.toml`:
+// Keys stored in `k5.toml`:
 //
 // [key]
 // algorithm = "MlDsa65Ed25519+MlKem768X25519"
-// aiwot = "..."             # OpenPGP fingerprint of the primary key, hex
+// k5 = "..."             # OpenPGP fingerprint of the primary key, hex
 // secret_key = """
 // -----BEGIN PGP PRIVATE KEY BLOCK-----
 // ...
@@ -11,7 +11,7 @@
 //
 // One OpenPGP v6 key: a MlDsa65Ed25519 primary (signing and certifying) with
 // a MlKem768X25519 encryption subkey. The primary key's OpenPGP fingerprint
-// is the aiwot id.
+// is the k5 id.
 //
 // This uses rpgp's `draft-pqc` feature, which implements the post-quantum
 // composite algorithms of draft-ietf-openpgp-pqc. That draft, and rpgp's
@@ -19,7 +19,7 @@
 // experimental and not for production use, so the on-wire format may still
 // change before the draft is finalized.
 //
-// The file is created by `aiwot init`, and never generated implicitly. Other
+// The file is created by `k5 init`, and never generated implicitly. Other
 // settings in the file are preserved.
 
 use std::path::Path;
@@ -39,17 +39,17 @@ pub type Error = Box<dyn std::error::Error>;
 const NAME: &str = "key";
 const ALGORITHM: &str = "MlDsa65Ed25519+MlKem768X25519";
 
-/// The `[key]` section of `aiwot.toml`.
+/// The `[key]` section of `k5.toml`.
 #[derive(Serialize, Deserialize)]
 struct KeyConfig {
     algorithm: String,
     /// Derived from the secret key. Added on load if missing.
     #[serde(default, skip_serializing_if = "Option::is_none")]
-    aiwot: Option<String>,
+    k5: Option<String>,
     secret_key: String,
 }
 
-/// The keys of this aiwot instance: one OpenPGP key, a `MlDsa65Ed25519`
+/// The keys of this k5 instance: one OpenPGP key, a `MlDsa65Ed25519`
 /// primary (signing and certifying) with a `MlKem768X25519` encryption
 /// subkey.
 pub struct Keys {
@@ -57,9 +57,9 @@ pub struct Keys {
 }
 
 impl Keys {
-    /// The aiwot id: the hex encoded OpenPGP fingerprint of the primary key.
-    pub fn aiwot(&self) -> String {
-        aiwot(&self.secret)
+    /// The k5 id: the hex encoded OpenPGP fingerprint of the primary key.
+    pub fn k5(&self) -> String {
+        k5(&self.secret)
     }
 
     /// The public key: the primary key and the encryption subkey, without any
@@ -119,9 +119,9 @@ impl Keys {
             .map_err(|e| format!("invalid secret key: {e}"))?;
 
         let keys = Self { secret };
-        if let Some(aiwot) = &config.aiwot {
-            if !aiwot.eq_ignore_ascii_case(&keys.aiwot()) {
-                return Err("aiwot does not match the secret key".into());
+        if let Some(k5) = &config.k5 {
+            if !k5.eq_ignore_ascii_case(&keys.k5()) {
+                return Err("k5 does not match the secret key".into());
             }
         }
 
@@ -131,15 +131,15 @@ impl Keys {
     fn to_toml(&self) -> Result<toml::Value, Error> {
         Ok(toml::Value::try_from(KeyConfig {
             algorithm: ALGORITHM.to_string(),
-            aiwot: Some(self.aiwot()),
+            k5: Some(self.k5()),
             secret_key: self.secret.to_armored_string(Default::default())?,
         })?)
     }
 }
 
-/// The aiwot id of an OpenPGP key: the hex encoded fingerprint of its primary
+/// The k5 id of an OpenPGP key: the hex encoded fingerprint of its primary
 /// key.
-pub fn aiwot(key: &SignedSecretKey) -> String {
+pub fn k5(key: &SignedSecretKey) -> String {
     key.primary_key.fingerprint().to_string()
 }
 
@@ -181,7 +181,7 @@ pub fn load(path: &Path) -> Result<Keys, Error> {
             .map_err(|e| format!("invalid {}: {e}", path.display()))?,
         Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
             return Err(format!(
-                "{} not found: run `aiwot init` to create your keys",
+                "{} not found: run `k5 init` to create your keys",
                 path.display()
             )
             .into())
@@ -191,8 +191,8 @@ pub fn load(path: &Path) -> Result<Keys, Error> {
 
     let value = config.get(NAME).cloned().ok_or_else(|| {
         format!(
-            "invalid {}: missing [{NAME}] section (this looks like an aiwot.toml from before \
-             the switch to OpenPGP keys; run `aiwot init` with a new config file)",
+            "invalid {}: missing [{NAME}] section (this looks like a k5.toml from before \
+             the switch to OpenPGP keys; run `k5 init` with a new config file)",
             path.display()
         )
     })?;
@@ -239,9 +239,9 @@ mod tests {
 
     #[test]
     fn test_create_load() {
-        let dir = std::env::temp_dir().join(format!("aiwot-key-test-{}", std::process::id()));
+        let dir = std::env::temp_dir().join(format!("k5-key-test-{}", std::process::id()));
         std::fs::create_dir_all(&dir).unwrap();
-        let path = dir.join("aiwot.toml");
+        let path = dir.join("k5.toml");
         let _ = std::fs::remove_file(&path);
 
         // Nothing is generated implicitly.
@@ -250,21 +250,21 @@ mod tests {
 
         let keys = create(&path).unwrap();
         let loaded = load(&path).unwrap();
-        assert_eq!(loaded.aiwot(), keys.aiwot());
+        assert_eq!(loaded.k5(), keys.k5());
 
         // Existing keys are never overwritten.
         assert!(create(&path).is_err());
-        assert_eq!(load(&path).unwrap().aiwot(), keys.aiwot());
+        assert_eq!(load(&path).unwrap().k5(), keys.k5());
 
         // Other settings are preserved when the section is updated.
         let mut config: toml::Table = std::fs::read_to_string(&path).unwrap().parse().unwrap();
         config.insert("other".to_string(), toml::Value::Integer(1));
-        config["key"].as_table_mut().unwrap().remove("aiwot");
+        config["key"].as_table_mut().unwrap().remove("k5");
         std::fs::write(&path, toml::to_string(&config).unwrap()).unwrap();
         load(&path).unwrap();
         let config: toml::Table = std::fs::read_to_string(&path).unwrap().parse().unwrap();
         assert_eq!(config["other"].as_integer(), Some(1));
-        assert_eq!(config["key"]["aiwot"].as_str(), Some(keys.aiwot().as_str()));
+        assert_eq!(config["key"]["k5"].as_str(), Some(keys.k5().as_str()));
 
         // A missing section is an error, not regenerated.
         let mut without_key = config.clone();
@@ -272,10 +272,10 @@ mod tests {
         std::fs::write(&path, toml::to_string(&without_key).unwrap()).unwrap();
         assert!(load(&path).is_err());
 
-        // A tampered aiwot id is rejected.
+        // A tampered k5 id is rejected.
         let tampered = std::fs::read_to_string(&path)
             .unwrap()
-            .replace(&keys.aiwot(), &"0".repeat(keys.aiwot().len()));
+            .replace(&keys.k5(), &"0".repeat(keys.k5().len()));
         std::fs::write(&path, tampered).unwrap();
         assert!(load(&path).is_err());
 

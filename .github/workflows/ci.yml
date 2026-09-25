@@ -43,10 +43,10 @@ jobs:
         uses: Swatinem/rust-cache@v2.7.7
 
       - name: Clippy
-        run: cargo clippy --workspace --exclude aiwot --keep-going --all-features --all-targets --locked -- -D warnings
+        run: cargo clippy --workspace --exclude k5 --keep-going --all-features --all-targets --locked -- -D warnings
 
-      - name: Clippy aiwot without zk-email
-        run: cargo clippy -p aiwot --all-targets --locked -- -D warnings
+      - name: Clippy k5 without zk-email
+        run: cargo clippy -p k5 --all-targets --locked -- -D warnings
 
   fmt:
     name: Check formatting
@@ -180,14 +180,14 @@ jobs:
       - name: Install cargo-llvm-cov
         uses: taiki-e/install-action@cargo-llvm-cov
       - name: Generate code coverage
-        run: cargo llvm-cov --all-features --workspace --exclude aiwot --locked --lcov --output-path lcov.info
-      - name: Generate aiwot coverage without zk-email
-        run: cargo llvm-cov -p aiwot --locked --lcov --output-path lcov-aiwot.info
+        run: cargo llvm-cov --all-features --workspace --exclude k5 --locked --lcov --output-path lcov.info
+      - name: Generate k5 coverage without zk-email
+        run: cargo llvm-cov -p k5 --locked --lcov --output-path lcov-k5.info
       - name: Upload coverage to Codecov
         uses: codecov/codecov-action@v4
         with:
           token: ${{ secrets.CODECOV_TOKEN }}
-          files: lcov.info,lcov-aiwot.info
+          files: lcov.info,lcov-k5.info
           fail_ci_if_error: true
 
   build-sgx:

@@ -4,9 +4,9 @@
 //
 // The signed statement, inside the encryption, is
 //
-// aiwot signcrypt
-// from:<aiwot of the sender>
-// to:<aiwot of the recipient>
+// k5 signcrypt
+// from:<k5 of the sender>
+// to:<k5 of the recipient>
 // <message>
 //
 // Unlike the Cleartext Signature Framework, an OpenPGP encrypted+signed
@@ -29,36 +29,33 @@ use crate::{
     message::Keyring,
 };
 
-const HEADER: &str = "aiwot signcrypt";
+const HEADER: &str = "k5 signcrypt";
 
 /// A decrypted and verified signcrypted message.
 pub struct Opened {
-    /// The aiwot id of the sender.
+    /// The k5 id of the sender.
     pub from: String,
     pub msg: String,
 }
 
-/// Normalizes an aiwot given on the command line: without the `aiwot:`
+/// Normalizes a k5 given on the command line: without the `k5:`
 /// prefix, lowercase.
-pub fn recipient_aiwot(aiwot: &str) -> String {
-    let aiwot = aiwot.trim();
-    aiwot
-        .strip_prefix("aiwot:")
-        .unwrap_or(aiwot)
-        .to_ascii_lowercase()
+pub fn recipient_k5(k5: &str) -> String {
+    let k5 = k5.trim();
+    k5.strip_prefix("k5:").unwrap_or(k5).to_ascii_lowercase()
 }
 
-/// Returns the `MlKem768X25519` encryption subkey of `aiwot` from its self
+/// Returns the `MlKem768X25519` encryption subkey of `k5` from its self
 /// attestation in the attestations directory, which must be valid.
-pub async fn recipient_encryption_key(aiwot: &str) -> Result<SignedPublicSubKey, Error> {
-    let aiwot = recipient_aiwot(aiwot);
-    let path = me::path(&aiwot);
+pub async fn recipient_encryption_key(k5: &str) -> Result<SignedPublicSubKey, Error> {
+    let k5 = recipient_k5(k5);
+    let path = me::path(&k5);
 
     let record = match tokio::fs::read_to_string(&path).await {
         Ok(record) => record,
         Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
             return Err(format!(
-                "no self attestation of aiwot:{aiwot} ({path}): its encryption key is unknown"
+                "no self attestation of k5:{k5} ({path}): its encryption key is unknown"
             )
             .into())
         }
@@ -66,8 +63,8 @@ pub async fn recipient_encryption_key(aiwot: &str) -> Result<SignedPublicSubKey,
     };
 
     let me = me::verify(&record).map_err(|e| format!("invalid self attestation {path}: {e}"))?;
-    if me.aiwot != aiwot {
-        return Err(format!("{path} is the self attestation of aiwot:{}", me.aiwot).into());
+    if me.k5 != k5 {
+        return Err(format!("{path} is the self attestation of k5:{}", me.k5).into());
     }
 
     me.public
@@ -84,7 +81,7 @@ pub fn seal(
     to_key: &SignedPublicSubKey,
     msg: &str,
 ) -> Result<String, Error> {
-    let mut builder = MessageBuilder::from_bytes("", statement(&keys.aiwot(), to, msg))
+    let mut builder = MessageBuilder::from_bytes("", statement(&keys.k5(), to, msg))
         .seipd_v1(OsRng, SymmetricKeyAlgorithm::AES256);
     builder
         .sign(
@@ -110,13 +107,13 @@ pub fn open(keys: &Keys, armored: &str, keyring: &Keyring) -> Result<Opened, Err
         .as_data_string()
         .map_err(|_| "decryption failed: not encrypted to this key, or tampered")?;
     let (from, to, body) = parse_statement(&plaintext)?;
-    if to != keys.aiwot() {
-        return Err(format!("message is for aiwot:{to}, not for aiwot:{}", keys.aiwot()).into());
+    if to != keys.k5() {
+        return Err(format!("message is for k5:{to}, not for k5:{}", keys.k5()).into());
     }
 
     let sender = keyring
         .get(&from)
-        .ok_or_else(|| format!("unknown sender aiwot:{from}: fetch its self attestation first"))?;
+        .ok_or_else(|| format!("unknown sender k5:{from}: fetch its self attestation first"))?;
     msg.verify(sender)?;
 
     Ok(Opened { from, msg: body })
@@ -144,13 +141,13 @@ fn parse_statement(statement: &str) -> Result<(String, String, String), Error> {
         .strip_prefix("to:")
         .ok_or("invalid signcrypt statement: expected `to:`")?;
 
-    let check_aiwot = |aiwot: &str| {
-        (aiwot.len() == 64 && aiwot.bytes().all(|b| b.is_ascii_hexdigit()))
-            .then(|| aiwot.to_ascii_lowercase())
-            .ok_or_else(|| Error::from(format!("invalid aiwot `{aiwot}`")))
+    let check_k5 = |k5: &str| {
+        (k5.len() == 64 && k5.bytes().all(|b| b.is_ascii_hexdigit()))
+            .then(|| k5.to_ascii_lowercase())
+            .ok_or_else(|| Error::from(format!("invalid k5 `{k5}`")))
     };
 
-    Ok((check_aiwot(from)?, check_aiwot(to)?, msg.to_string()))
+    Ok((check_k5(from)?, check_k5(to)?, msg.to_string()))
 }
 
 #[cfg(test)]
@@ -159,7 +156,7 @@ mod tests {
     use crate::key::test_keys;
 
     fn keyring_of(keys: &Keys) -> Keyring {
-        Keyring::from([(keys.aiwot(), keys.public())])
+        Keyring::from([(keys.k5(), keys.public())])
     }
 
     #[test]
@@ -169,7 +166,7 @@ mod tests {
 
         let sealed = seal(
             &alice,
-            &bob.aiwot(),
+            &bob.k5(),
             &bob.encryption_subkey().unwrap(),
             "hi Bob\n# msg\n",
         )
@@ -179,7 +176,7 @@ mod tests {
 
         let opened = open(&bob, &sealed, &keyring_of(&alice)).unwrap();
         assert_eq!(opened.msg, "hi Bob\n# msg\n");
-        assert_eq!(opened.from, alice.aiwot());
+        assert_eq!(opened.from, alice.k5());
 
         // Someone else cannot open it.
         let eve = test_keys();
@@ -198,7 +195,7 @@ mod tests {
         let carol = test_keys();
 
         let mut builder =
-            MessageBuilder::from_bytes("", statement(&alice.aiwot(), &bob.aiwot(), "for Bob"))
+            MessageBuilder::from_bytes("", statement(&alice.k5(), &bob.k5(), "for Bob"))
                 .seipd_v1(OsRng, SymmetricKeyAlgorithm::AES256);
         builder
             .sign(

@@ -1,10 +1,10 @@
-// Attestations of aiwot profiles, stored as markdown records in [`DIR`]:
+// Attestations of k5 profiles, stored as markdown records in [`DIR`]:
 //
 // - `tlsnotary`: a TLSNotary notarized session with a server, whose profile is
 //   extracted by the `tlsnotary::plugins` (`- Type: tlsn`).
-// - `keysignparty`: another aiwot signs that it knows the owner of an aiwot (`-
+// - `keysignparty`: another k5 signs that it knows the owner of a k5 (`-
 //   Type: keysignparty`).
-// - `me`: an aiwot signs its own public keys, including the key encapsulation
+// - `me`: a k5 signs its own public keys, including the key encapsulation
 //   key (`- Type: self_attestation`, formerly `me`). Created automatically for
 //   the local keys.
 //
@@ -30,30 +30,30 @@ use crate::{message::Keyring, parallel::parallel_map};
 pub type Error = Box<dyn std::error::Error>;
 
 /// A profile proven by a session, displayed as
-/// `<platform>/<user>/aiwot:<aiwot>`.
+/// `<platform>/<user>/k5:<k5>`.
 pub struct Profile {
     pub platform: &'static str,
     pub user: String,
-    pub aiwot: String,
+    pub k5: String,
 }
 
 impl fmt::Display for Profile {
     fn fmt(&self, f: &mut fmt::Formatter) -> fmt::Result {
-        write!(f, "{}/{}/aiwot:{}", self.platform, self.user, self.aiwot)
+        write!(f, "{}/{}/k5:{}", self.platform, self.user, self.k5)
     }
 }
 
 /// Directory where attestation records are stored.
 pub const DIR: &str = "db/attestations";
 
-/// A verified attestation of an aiwot.
+/// A verified attestation of a k5.
 pub enum Attested {
     /// A TLSNotary attestation of a session with a server.
     Tlsn(tlsnotary::Verified),
-    /// A key sign party attestation signed by another aiwot.
+    /// A key sign party attestation signed by another k5.
     KeySign(keysignparty::KeySign),
-    /// A self attestation of the public keys of an aiwot.
-    Me(me::Me),
+    /// A self attestation of the public keys of a k5.
+    Me(Box<me::Me>),
     /// A fake TLSNotary attestation, signed by the identity itself.
     Fake(fake::Fake),
 }
@@ -75,8 +75,8 @@ impl std::fmt::Display for ProfileAttestation {
     fn fmt(&self, f: &mut std::fmt::Formatter) -> std::fmt::Result {
         write!(f, "{}:{}", self.profile.platform, self.profile.user)?;
         match &self.signer {
-            Some(signer) if *signer == self.profile.aiwot => write!(f, " (self-signed)")?,
-            Some(signer) => write!(f, " (signed by aiwot:{signer})")?,
+            Some(signer) if *signer == self.profile.k5 => write!(f, " (self-signed)")?,
+            Some(signer) => write!(f, " (signed by k5:{signer})")?,
             None => {}
         }
         if self.fake {
@@ -122,7 +122,7 @@ impl Attested {
                 profile: keysign.profile(),
                 attributes: vec![
                     ("type", keysignparty::RECORD_TYPE.to_string()),
-                    ("signer", format!("aiwot:{}", keysign.signer)),
+                    ("signer", format!("k5:{}", keysign.signer)),
                     ("date", keysign.date),
                 ],
                 signer: Some(keysign.signer),
@@ -139,7 +139,7 @@ impl Attested {
                     ),
                     ("date", me.date.clone()),
                 ],
-                signer: Some(me.aiwot.clone()),
+                signer: Some(me.k5.clone()),
                 file,
                 fake,
             },
@@ -162,7 +162,7 @@ impl Attested {
 }
 
 /// Verifies an attestation record of any type. TLSNotary records must be
-/// signed by `notary_key`. Records signed by another aiwot (key sign party
+/// signed by `notary_key`. Records signed by another k5 (key sign party
 /// and fake attestations) resolve the signer's public key from `keyring`, by
 /// the fingerprint carried in the signature, as a real PGP keyring would.
 pub fn verify(record: &str, notary_key: &str, keyring: &Keyring) -> Result<Attested, Error> {
@@ -175,7 +175,7 @@ pub fn verify(record: &str, notary_key: &str, keyring: &Keyring) -> Result<Attes
         }
         tlsnotary::RECORD_TYPE => Attested::Tlsn(tlsnotary::verify(record, notary_key)?),
         keysignparty::RECORD_TYPE => Attested::KeySign(keysignparty::verify(record, keyring)?),
-        me::RECORD_TYPE => Attested::Me(me::verify(record)?),
+        me::RECORD_TYPE => Attested::Me(Box::new(me::verify(record)?)),
         other => return Err(format!("unsupported attestation type `{other}`").into()),
     };
 
@@ -188,7 +188,7 @@ pub fn verify(record: &str, notary_key: &str, keyring: &Keyring) -> Result<Attes
 }
 
 /// Builds a keyring of the public keys of the self attestations in [`DIR`],
-/// by aiwot id, as a real PGP keyring would be built from fetched public
+/// by k5 id, as a real PGP keyring would be built from fetched public
 /// keys. Invalid records are ignored: they are reported when checked as
 /// attestations in their own right.
 pub async fn keyring() -> Result<Keyring, Error> {
@@ -211,7 +211,7 @@ pub async fn keyring() -> Result<Keyring, Error> {
     for file in files {
         if let Ok(record) = tokio::fs::read_to_string(format!("{DIR}/{file}")).await {
             if let Ok(me) = me::verify(&record) {
-                keyring.insert(me.aiwot, me.public);
+                keyring.insert(me.k5, me.public);
             }
         }
     }
@@ -243,33 +243,41 @@ fn info_field<'a>(record: &'a str, prefix: &str) -> Option<&'a str> {
         .map(str::trim)
 }
 
-/// Returns the valid attestations in [`DIR`] of `aiwot`. Every candidate
-/// record is fully verified; invalid ones are reported and skipped.
-pub async fn attested_by(aiwot: &str, notary_key: &str) -> Result<Vec<ProfileAttestation>, Error> {
-    let prefix = format!("{}-", aiwot.to_ascii_lowercase());
+/// The valid attestations of a set of records, and the invalid ones that
+/// were skipped.
+#[derive(Default)]
+pub struct Listing {
+    pub attestations: Vec<ProfileAttestation>,
+    pub invalid: Vec<Invalid>,
+}
+
+/// A record that failed verification.
+pub struct Invalid {
+    pub file: String,
+    pub error: String,
+}
+
+/// Returns the valid attestations in [`DIR`] of `k5`. Every candidate
+/// record is fully verified; invalid ones are returned apart.
+pub async fn attested_by(k5: &str, notary_key: &str) -> Result<Listing, Error> {
+    let prefix = format!("{}-", k5.to_ascii_lowercase());
     Ok(valid(check(Some(&prefix), notary_key).await?))
 }
 
-/// Returns all the valid attestations in [`DIR`], sorted by aiwot and
-/// profile. Invalid records are reported and skipped.
-pub async fn list(notary_key: &str) -> Result<Vec<ProfileAttestation>, Error> {
-    let mut attestations = valid(check(None, notary_key).await?);
-    attestations.sort_by(|a, b| {
-        (
-            &a.profile.aiwot,
-            a.profile.platform,
-            &a.profile.user,
-            &a.file,
-        )
-            .cmp(&(
-                &b.profile.aiwot,
-                b.profile.platform,
-                &b.profile.user,
-                &b.file,
-            ))
+/// Returns all the valid attestations in [`DIR`], sorted by k5 and
+/// profile. Invalid records are returned apart.
+pub async fn list(notary_key: &str) -> Result<Listing, Error> {
+    let mut listing = valid(check(None, notary_key).await?);
+    listing.attestations.sort_by(|a, b| {
+        (&a.profile.k5, a.profile.platform, &a.profile.user, &a.file).cmp(&(
+            &b.profile.k5,
+            b.profile.platform,
+            &b.profile.user,
+            &b.file,
+        ))
     });
 
-    Ok(attestations)
+    Ok(listing)
 }
 
 /// Checks every file in [`DIR`], returning the result for each one, sorted
@@ -284,14 +292,14 @@ pub struct Checked {
     pub result: Result<ProfileAttestation, String>,
 }
 
-/// Checks that a record file name starts with the attested aiwot, as the
-/// lookup by aiwot relies on it.
+/// Checks that a record file name starts with the attested k5, as the
+/// lookup by k5 relies on it.
 fn check_file_name(file: &str, attestation: &ProfileAttestation) -> Result<(), Error> {
-    let expected = format!("{}-", attestation.profile.aiwot);
+    let expected = format!("{}-", attestation.profile.k5);
     if !file.to_ascii_lowercase().starts_with(&expected) {
         return Err(format!(
-            "file name does not match the attested aiwot:{}",
-            attestation.profile.aiwot
+            "file name does not match the attested k5:{}",
+            attestation.profile.k5
         )
         .into());
     }
@@ -299,23 +307,25 @@ fn check_file_name(file: &str, attestation: &ProfileAttestation) -> Result<(), E
     Ok(())
 }
 
-/// Keeps the valid attestations, reporting the invalid ones.
-fn valid(checked: Vec<Checked>) -> Vec<ProfileAttestation> {
-    checked
-        .into_iter()
-        .filter_map(|checked| match checked.result {
-            Ok(attestation) => Some(attestation),
-            Err(e) => {
-                eprintln!("Ignoring invalid attestation {DIR}/{}: {e}", checked.file);
-                None
-            }
-        })
-        .collect()
+/// Splits checked records into the valid attestations and the invalid ones.
+fn valid(checked: Vec<Checked>) -> Listing {
+    let mut listing = Listing::default();
+    for checked in checked {
+        match checked.result {
+            Ok(attestation) => listing.attestations.push(attestation),
+            Err(error) => listing.invalid.push(Invalid {
+                file: checked.file,
+                error,
+            }),
+        }
+    }
+
+    listing
 }
 
 /// Verifies the files in [`DIR`] whose name starts with `prefix` (all if
 /// `None`). Hidden files are ignored. A record is valid if it verifies and its
-/// file name starts with the attested aiwot.
+/// file name starts with the attested k5.
 async fn check(prefix: Option<&str>, notary_key: &str) -> Result<Vec<Checked>, Error> {
     let mut entries = match tokio::fs::read_dir(DIR).await {
         Ok(entries) => entries,
@@ -357,7 +367,7 @@ async fn check(prefix: Option<&str>, notary_key: &str) -> Result<Vec<Checked>, E
 }
 
 /// Verifies the record stored in `file`, whose name must start with the
-/// attested aiwot.
+/// attested k5.
 fn check_record(
     file: &str,
     record: &str,

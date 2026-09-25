@@ -4,8 +4,8 @@
 // without any TLS session or notary: the identity signs a statement about its
 // own profile:
 //
-// aiwot fake tlsn
-// aiwot:<aiwot>
+// k5 fake tlsn
+// k5:<k5>
 // platform:<X | github | site>
 // user:<user>
 // server:<server of the profile>
@@ -22,7 +22,7 @@ use crate::{
     message::{self, Keyring},
 };
 
-const STATEMENT_HEADER: &str = "aiwot fake tlsn";
+const STATEMENT_HEADER: &str = "k5 fake tlsn";
 
 /// The platforms of fake attestations, with the server of their profiles (a
 /// website is its own server).
@@ -34,7 +34,7 @@ const PLATFORMS: &[(&str, Option<&str>)] = &[
 
 /// A verified fake attestation.
 pub struct Fake {
-    pub aiwot: String,
+    pub k5: String,
     pub platform: &'static str,
     pub user: String,
     pub server: String,
@@ -46,7 +46,7 @@ impl Fake {
         Profile {
             platform: self.platform,
             user: self.user.clone(),
-            aiwot: self.aiwot.clone(),
+            k5: self.k5.clone(),
         }
     }
 }
@@ -54,12 +54,12 @@ impl Fake {
 /// Creates a fake attestation of the `platform` profile `user` of `keys`,
 /// returning the record file name and content.
 pub fn create(keys: &Keys, platform: &str, user: &str) -> Result<(String, String), Error> {
-    let aiwot = keys.aiwot();
+    let k5 = keys.k5();
     let (platform, server) = server(platform, user)?;
     let date = chrono::Utc::now().to_rfc3339_opts(chrono::SecondsFormat::Secs, true);
 
     let fake = Fake {
-        aiwot,
+        k5,
         platform,
         user: user.to_string(),
         server,
@@ -75,7 +75,7 @@ pub fn create(keys: &Keys, platform: &str, user: &str) -> Result<(String, String
          - Created: {date}\n\
          - Profile: {profile}\n\
          - Server: {server}\n\
-         - Signed by: aiwot:{aiwot} (no TLS session nor notary)\n\
+         - Signed by: k5:{k5} (no TLS session nor notary)\n\
          \n\
          # statement\n\
          {armored}",
@@ -83,14 +83,14 @@ pub fn create(keys: &Keys, platform: &str, user: &str) -> Result<(String, String
         date = fake.date,
         profile = fake.profile(),
         server = fake.server,
-        aiwot = fake.aiwot,
+        k5 = fake.k5,
     );
-    let file_name = format!("{}-{}-{}.md", fake.aiwot, fake.platform, fake.user);
+    let file_name = format!("{}-{}-{}.md", fake.k5, fake.platform, fake.user);
 
     Ok((file_name, record))
 }
 
-/// Verifies a fake attestation record, which must be signed by the aiwot of
+/// Verifies a fake attestation record, which must be signed by the k5 of
 /// the profile, resolving its public key from `keyring`.
 pub fn verify(record: &str, keyring: &Keyring) -> Result<Fake, Error> {
     let (_, armored) = record
@@ -99,10 +99,10 @@ pub fn verify(record: &str, keyring: &Keyring) -> Result<Fake, Error> {
     let verified = message::verify(armored, keyring)?;
 
     let fake = parse_statement(&verified.msg)?;
-    if !fake.aiwot.eq_ignore_ascii_case(&verified.from) {
+    if !fake.k5.eq_ignore_ascii_case(&verified.from) {
         return Err(format!(
-            "fake attestation of aiwot:{} is signed by aiwot:{}",
-            fake.aiwot, verified.from
+            "fake attestation of k5:{} is signed by k5:{}",
+            fake.k5, verified.from
         )
         .into());
     }
@@ -112,8 +112,8 @@ pub fn verify(record: &str, keyring: &Keyring) -> Result<Fake, Error> {
 
 fn statement(fake: &Fake) -> String {
     format!(
-        "{STATEMENT_HEADER}\naiwot:{}\nplatform:{}\nuser:{}\nserver:{}\ndate:{}",
-        fake.aiwot, fake.platform, fake.user, fake.server, fake.date
+        "{STATEMENT_HEADER}\nk5:{}\nplatform:{}\nuser:{}\nserver:{}\ndate:{}",
+        fake.k5, fake.platform, fake.user, fake.server, fake.date
     )
 }
 
@@ -129,9 +129,9 @@ fn parse_statement(statement: &str) -> Result<Fake, Error> {
     if !field(STATEMENT_HEADER)?.is_empty() {
         return Err("invalid fake attestation statement header".into());
     }
-    let aiwot = field("aiwot:")?.to_ascii_lowercase();
-    if aiwot.len() != 64 || !aiwot.bytes().all(|b| b.is_ascii_hexdigit()) {
-        return Err(format!("invalid aiwot `{aiwot}`").into());
+    let k5 = field("k5:")?.to_ascii_lowercase();
+    if k5.len() != 64 || !k5.bytes().all(|b| b.is_ascii_hexdigit()) {
+        return Err(format!("invalid k5 `{k5}`").into());
     }
     let platform = field("platform:")?.to_string();
     let user = field("user:")?.to_string();
@@ -147,7 +147,7 @@ fn parse_statement(statement: &str) -> Result<Fake, Error> {
     }
 
     Ok(Fake {
-        aiwot,
+        k5,
         platform,
         user,
         server,
@@ -186,7 +186,7 @@ mod tests {
     use crate::key::test_keys;
 
     fn keyring_of(keys: &Keys) -> Keyring {
-        Keyring::from([(keys.aiwot(), keys.public())])
+        Keyring::from([(keys.k5(), keys.public())])
     }
 
     #[test]
@@ -200,15 +200,15 @@ mod tests {
             ("site", "aliceharris.com", "aliceharris.com"),
         ] {
             let (file_name, record) = create(&keys, platform, user).unwrap();
-            assert_eq!(file_name, format!("{}-{platform}-{user}.md", keys.aiwot()));
+            assert_eq!(file_name, format!("{}-{platform}-{user}.md", keys.k5()));
             assert!(record.starts_with("# info\n\n- Type: tlsn\n- Fake: true\n"));
 
             let fake = verify(&record, &keyring).unwrap();
-            assert_eq!(fake.aiwot, keys.aiwot());
+            assert_eq!(fake.k5, keys.k5());
             assert_eq!(fake.server, server);
             assert_eq!(
                 fake.profile().to_string(),
-                format!("{platform}/{user}/aiwot:{}", keys.aiwot())
+                format!("{platform}/{user}/k5:{}", keys.k5())
             );
 
             // The signed statement cannot be changed.
