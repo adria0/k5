@@ -24,13 +24,19 @@ use std::{
     path::PathBuf,
 };
 
+use pgp::{
+    composed::{EncryptionCaps, KeyType, SecretKeyParamsBuilder, SubkeyParamsBuilder},
+    types::{KeyDetails, KeyVersion},
+};
+use rand::SeedableRng;
+use rand_chacha::ChaCha8Rng;
 use sha2::{Digest, Sha256};
 
 use crate::parallel::parallel_map;
 
 use crate::{
     attestations::{self, export, fake, keysignparty, me, Attested, Error, ProfileAttestation},
-    key::{self, KemKey, Keys, SigningKey},
+    key::{self, Keys},
 };
 
 /// Directory of the identity config files.
@@ -117,7 +123,7 @@ pub fn parse_seed(seed: &str) -> Result<u64, Error> {
 
 /// Generates `n` identities and their keysigns from `seed`, then audits the
 /// result.
-pub async fn run(me: &SigningKey, n: usize, seed: u64) -> Result<Summary, Error> {
+pub async fn run(me: &Keys, n: usize, seed: u64) -> Result<Summary, Error> {
     if !(2..=MAX_IDS).contains(&n) {
         return Err(format!("the number of identities must be between 2 and {MAX_IDS}").into());
     }
@@ -180,11 +186,9 @@ pub async fn run(me: &SigningKey, n: usize, seed: u64) -> Result<Summary, Error>
     // Signing and base58 encoding dominate, so records are created in
     // parallel. They are not verified here, as the audit verifies them all.
     let records = parallel_map(&edges, |edge| {
-        let signer = edge
-            .signer
-            .map_or(me, |signer| &identities[signer].keys.signing);
+        let signer = edge.signer.map_or(me, |signer| &identities[signer].keys);
         let subject = &identities[edge.subject];
-        keysignparty::create(signer, &subject.keys.signing.aiwot(), &subject.name, true)
+        keysignparty::create(signer, &subject.keys.aiwot(), &subject.name, true)
             .map_err(|e| e.to_string())
     });
 
@@ -197,12 +201,12 @@ pub async fn run(me: &SigningKey, n: usize, seed: u64) -> Result<Summary, Error>
         paths.push(path);
     }
 
-    // Self attestations of the identities, with their KEM keys.
+    // Self attestations of the identities, with their encryption keys.
     let me_records = parallel_map(&identities, |identity| {
-        me::create(&identity.keys.signing, &identity.keys.kem, true).map_err(|e| e.to_string())
+        me::create(&identity.keys, true).map_err(|e| e.to_string())
     });
     for (identity, record) in identities.iter().zip(me_records) {
-        tokio::fs::write(me::path(&identity.keys.signing.aiwot()), record?).await?;
+        tokio::fs::write(me::path(&identity.keys.aiwot()), record?).await?;
     }
 
     // Fake profile attestations.
@@ -216,7 +220,7 @@ pub async fn run(me: &SigningKey, n: usize, seed: u64) -> Result<Summary, Error>
         })
         .collect();
     let fake_records = parallel_map(&fakes, |(index, platform, user)| {
-        fake::create(&identities[*index].keys.signing, platform, user).map_err(|e| e.to_string())
+        fake::create(&identities[*index].keys, platform, user).map_err(|e| e.to_string())
     });
     let mut fake_paths = Vec::with_capacity(fakes.len());
     for record in fake_records {
@@ -264,7 +268,7 @@ pub async fn run(me: &SigningKey, n: usize, seed: u64) -> Result<Summary, Error>
 /// one fake profile, at most one per platform; and every identity is on a
 /// trust path from the local aiwot.
 async fn audit(
-    me: &SigningKey,
+    me: &Keys,
     identities: &[Identity],
     edges: &[Edge],
     paths: &[String],
@@ -275,12 +279,16 @@ async fn audit(
         check_identity(identity)?;
     }
 
+    // Every self attestation is written to disk before this runs, so a
+    // single keyring built once covers every signer.
+    let keyring = attestations::keyring().await?;
+
     let mut records = Vec::with_capacity(paths.len());
     for path in paths {
         records.push((path, tokio::fs::read_to_string(path).await?));
     }
     let verified = parallel_map(&records, |(path, record)| {
-        match attestations::verify(record, "").map_err(|e| format!("{path}: {e}"))? {
+        match attestations::verify(record, "", &keyring).map_err(|e| format!("{path}: {e}"))? {
             Attested::KeySign(keysign) if keysign.fake => Ok(keysign),
             _ => Err(format!("{path}: not a fake keysign")),
         }
@@ -291,13 +299,12 @@ async fn audit(
     for ((edge, path), keysign) in edges.iter().zip(paths).zip(verified) {
         let keysign = keysign?;
 
-        let signer = edge.signer.map_or_else(
-            || me.aiwot(),
-            |signer| identities[signer].keys.signing.aiwot(),
-        );
+        let signer = edge
+            .signer
+            .map_or_else(|| me.aiwot(), |signer| identities[signer].keys.aiwot());
         let subject = &identities[edge.subject];
         if keysign.signer != signer
-            || keysign.subject != subject.keys.signing.aiwot()
+            || keysign.subject != subject.keys.aiwot()
             || keysign.name != subject.name
         {
             return Err(format!("{path}: unexpected keysign").into());
@@ -318,18 +325,20 @@ async fn audit(
 
     let mut me_records = Vec::with_capacity(identities.len());
     for identity in identities {
-        let path = me::path(&identity.keys.signing.aiwot());
+        let path = me::path(&identity.keys.aiwot());
         me_records.push((path.clone(), tokio::fs::read_to_string(&path).await?));
     }
     let verified = parallel_map(&me_records, |(path, record)| {
-        match attestations::verify(record, "").map_err(|e| format!("{path}: {e}"))? {
+        match attestations::verify(record, "", &keyring).map_err(|e| format!("{path}: {e}"))? {
             Attested::Me(me) if me.fake => Ok(me),
             _ => Err(format!("{path}: not a fake self attestation")),
         }
     });
     for (identity, me) in identities.iter().zip(verified) {
         let me = me?;
-        if me.aiwot != identity.keys.signing.aiwot() || me.kem_public != identity.keys.kem.public()
+        if me.aiwot != identity.keys.aiwot()
+            || me.encryption_fingerprint()
+                != Some(identity.keys.encryption_subkey()?.fingerprint().to_string())
         {
             return Err(format!(
                 "self attestation of {} does not match its keys",
@@ -344,7 +353,7 @@ async fn audit(
         fake_records.push((path, tokio::fs::read_to_string(path).await?));
     }
     let verified = parallel_map(&fake_records, |(path, record)| match attestations::verify(
-        record, "",
+        record, "", &keyring,
     )
     .map_err(|e| format!("{path}: {e}"))?
     {
@@ -355,10 +364,7 @@ async fn audit(
     for (&(index, platform, user), fake) in fakes.iter().zip(verified) {
         let fake = fake?;
         let identity = &identities[index];
-        if fake.aiwot != identity.keys.signing.aiwot()
-            || fake.platform != platform
-            || fake.user != user
-        {
+        if fake.aiwot != identity.keys.aiwot() || fake.platform != platform || fake.user != user {
             return Err(format!(
                 "unexpected fake {platform} attestation of {}",
                 identity.name
@@ -375,7 +381,7 @@ async fn audit(
 
     let trusted = export::trusted(&me.aiwot(), attestations.iter());
     for identity in identities {
-        if !trusted.contains(&identity.keys.signing.aiwot()) {
+        if !trusted.contains(&identity.keys.aiwot()) {
             return Err(format!("{} is not reachable from your aiwot", identity.name).into());
         }
     }
@@ -387,8 +393,9 @@ async fn audit(
 fn check_identity(identity: &Identity) -> Result<(), Error> {
     let path = identity.path.display();
     let loaded = key::load(&identity.path)?;
-    if loaded.signing.aiwot() != identity.keys.signing.aiwot()
-        || loaded.kem.public() != identity.keys.kem.public()
+    if loaded.aiwot() != identity.keys.aiwot()
+        || loaded.encryption_subkey()?.fingerprint()
+            != identity.keys.encryption_subkey()?.fingerprint()
     {
         return Err(format!("{path} does not hold the identity derived from the seed").into());
     }
@@ -401,18 +408,45 @@ fn check_identity(identity: &Identity) -> Result<(), Error> {
     Ok(())
 }
 
-/// Derives the keys of identity `index`.
-fn derive_keys(seed: u64, index: u64) -> Keys {
-    let half = |label| derive(seed, label, index);
-    let [a, b] = [half("ml_kem_768_seed_d"), half("ml_kem_768_seed_z")];
-    let mut ml_kem_768_seed = [0u8; 64];
-    ml_kem_768_seed[..32].copy_from_slice(&a);
-    ml_kem_768_seed[32..].copy_from_slice(&b);
+/// The fixed key creation time of every identity `derive_keys` generates, so
+/// that regenerating the same (seed, index) always yields the same OpenPGP
+/// fingerprints.
+fn fakegraph_epoch() -> pgp::types::Timestamp {
+    pgp::types::Timestamp::from_secs(1_700_000_000)
+}
 
-    Keys {
-        signing: SigningKey::from_seeds(half("ed25519_seed"), half("ml_dsa_44_seed")),
-        kem: KemKey::from_secrets(half("x25519_secret"), ml_kem_768_seed),
-    }
+/// Derives the keys of identity `index`: a deterministic OpenPGP key, seeded
+/// from `seed` and `index` alone, with a fixed creation time so its
+/// fingerprints are reproducible.
+fn derive_keys(seed: u64, index: u64) -> Keys {
+    let mut rng = ChaCha8Rng::from_seed(derive(seed, "openpgp_key_seed", index));
+
+    let params = SecretKeyParamsBuilder::default()
+        .version(KeyVersion::V6)
+        .key_type(KeyType::MlDsa65Ed25519)
+        .can_sign(true)
+        .can_certify(true)
+        .passphrase(None)
+        .created_at(fakegraph_epoch())
+        .subkey(
+            SubkeyParamsBuilder::default()
+                .version(KeyVersion::V6)
+                .key_type(KeyType::MlKem768X25519)
+                .can_encrypt(EncryptionCaps::All)
+                .passphrase(None)
+                .created_at(fakegraph_epoch())
+                .build()
+                .expect("valid subkey params"),
+        )
+        .build()
+        .expect("valid key params");
+
+    let secret = params
+        .generate(&mut rng)
+        .expect("deterministic key generation");
+    secret.verify_bindings().expect("valid generated key");
+
+    Keys { secret }
 }
 
 /// Unique names for `n` identities.
@@ -634,14 +668,8 @@ mod tests {
         assert_eq!(graph_of(1), graph_of(1));
         assert_ne!(graph_of(1), graph_of(2));
 
-        assert_eq!(
-            derive_keys(7, 3).signing.aiwot(),
-            derive_keys(7, 3).signing.aiwot()
-        );
-        assert_ne!(
-            derive_keys(7, 3).signing.aiwot(),
-            derive_keys(7, 4).signing.aiwot()
-        );
+        assert_eq!(derive_keys(7, 3).aiwot(), derive_keys(7, 3).aiwot());
+        assert_ne!(derive_keys(7, 3).aiwot(), derive_keys(7, 4).aiwot());
     }
 
     #[test]
@@ -650,7 +678,7 @@ mod tests {
         let names = names(&mut rng, MAX_IDS);
         let profiles = fake_profiles(&mut rng, &names);
 
-        let key = SigningKey::from_seeds([1; 32], [2; 32]);
+        let key = crate::key::test_keys();
         let mut per_platform: HashMap<&str, usize> = HashMap::new();
         for (index, (name, profiles)) in names.iter().zip(&profiles).enumerate() {
             // At least one profile, at most one per platform.

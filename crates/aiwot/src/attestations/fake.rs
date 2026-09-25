@@ -12,11 +12,15 @@
 // date:<creation time, RFC 3339>
 //
 // The record has `- Type: tlsn` and `- Fake: true` in its `# info` section,
-// followed by the signed statement. A fake attestation proves nothing about
-// the profile: it is only accepted as fake, and is always displayed as such.
+// followed by the signed statement (an armored, OpenPGP cleartext-signed
+// message). A fake attestation proves nothing about the profile: it is only
+// accepted as fake, and is always displayed as such.
 
 use super::{Error, Profile};
-use crate::{key::SigningKey, message::SignedMessage};
+use crate::{
+    key::Keys,
+    message::{self, Keyring},
+};
 
 const STATEMENT_HEADER: &str = "aiwot fake tlsn";
 
@@ -47,10 +51,10 @@ impl Fake {
     }
 }
 
-/// Creates a fake attestation of the `platform` profile `user` of `key`,
+/// Creates a fake attestation of the `platform` profile `user` of `keys`,
 /// returning the record file name and content.
-pub fn create(key: &SigningKey, platform: &str, user: &str) -> Result<(String, String), Error> {
-    let aiwot = key.aiwot();
+pub fn create(keys: &Keys, platform: &str, user: &str) -> Result<(String, String), Error> {
+    let aiwot = keys.aiwot();
     let (platform, server) = server(platform, user)?;
     let date = chrono::Utc::now().to_rfc3339_opts(chrono::SecondsFormat::Secs, true);
 
@@ -61,7 +65,7 @@ pub fn create(key: &SigningKey, platform: &str, user: &str) -> Result<(String, S
         server,
         date,
     };
-    let signed = SignedMessage::sign(key, &statement(&fake))?;
+    let armored = message::sign(&keys.secret, &statement(&fake))?;
 
     let record = format!(
         "# info\n\
@@ -73,13 +77,13 @@ pub fn create(key: &SigningKey, platform: &str, user: &str) -> Result<(String, S
          - Server: {server}\n\
          - Signed by: aiwot:{aiwot} (no TLS session nor notary)\n\
          \n\
-         {signed}",
+         # statement\n\
+         {armored}",
         record_type = super::tlsnotary::RECORD_TYPE,
         date = fake.date,
         profile = fake.profile(),
         server = fake.server,
         aiwot = fake.aiwot,
-        signed = signed.to_markdown(),
     );
     let file_name = format!("{}-{}-{}.md", fake.aiwot, fake.platform, fake.user);
 
@@ -87,19 +91,18 @@ pub fn create(key: &SigningKey, platform: &str, user: &str) -> Result<(String, S
 }
 
 /// Verifies a fake attestation record, which must be signed by the aiwot of
-/// the profile.
-pub fn verify(record: &str) -> Result<Fake, Error> {
-    let (_, signed) = record
-        .split_once("\n# from\n")
-        .ok_or("fake attestation has no `# from` section")?;
-    let signed = SignedMessage::parse(&format!("# from\n{signed}"))?;
-    signed.verify()?;
+/// the profile, resolving its public key from `keyring`.
+pub fn verify(record: &str, keyring: &Keyring) -> Result<Fake, Error> {
+    let (_, armored) = record
+        .split_once("\n# statement\n")
+        .ok_or("fake attestation has no `# statement` section")?;
+    let verified = message::verify(armored, keyring)?;
 
-    let fake = parse_statement(&signed.msg)?;
-    if !fake.aiwot.eq_ignore_ascii_case(&signed.from) {
+    let fake = parse_statement(&verified.msg)?;
+    if !fake.aiwot.eq_ignore_ascii_case(&verified.from) {
         return Err(format!(
             "fake attestation of aiwot:{} is signed by aiwot:{}",
-            fake.aiwot, signed.from
+            fake.aiwot, verified.from
         )
         .into());
     }
@@ -180,36 +183,41 @@ fn server(platform: &str, user: &str) -> Result<(&'static str, String), Error> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::key::test_signing_key;
+    use crate::key::test_keys;
+
+    fn keyring_of(keys: &Keys) -> Keyring {
+        Keyring::from([(keys.aiwot(), keys.public())])
+    }
 
     #[test]
     fn test_create_verify() {
-        let key = test_signing_key();
+        let keys = test_keys();
+        let keyring = keyring_of(&keys);
 
         for (platform, user, server) in [
             ("X", "aliceharris", "cdn.syndication.twimg.com"),
             ("github", "aliceharris", "gist.githubusercontent.com"),
             ("site", "aliceharris.com", "aliceharris.com"),
         ] {
-            let (file_name, record) = create(&key, platform, user).unwrap();
-            assert_eq!(file_name, format!("{}-{platform}-{user}.md", key.aiwot()));
+            let (file_name, record) = create(&keys, platform, user).unwrap();
+            assert_eq!(file_name, format!("{}-{platform}-{user}.md", keys.aiwot()));
             assert!(record.starts_with("# info\n\n- Type: tlsn\n- Fake: true\n"));
 
-            let fake = verify(&record).unwrap();
-            assert_eq!(fake.aiwot, key.aiwot());
+            let fake = verify(&record, &keyring).unwrap();
+            assert_eq!(fake.aiwot, keys.aiwot());
             assert_eq!(fake.server, server);
             assert_eq!(
                 fake.profile().to_string(),
-                format!("{platform}/{user}/aiwot:{}", key.aiwot())
+                format!("{platform}/{user}/aiwot:{}", keys.aiwot())
             );
 
             // The signed statement cannot be changed.
             let forged = record.replace(&format!("\nuser:{user}\n"), "\nuser:mallory\n");
-            assert!(verify(&forged).is_err());
+            assert!(verify(&forged, &keyring).is_err());
         }
 
-        assert!(create(&key, "facebook", "alice").is_err());
-        assert!(create(&key, "site", "www.alice.com").is_err());
-        assert!(create(&key, "X", "../alice").is_err());
+        assert!(create(&keys, "facebook", "alice").is_err());
+        assert!(create(&keys, "site", "www.alice.com").is_err());
+        assert!(create(&keys, "X", "../alice").is_err());
     }
 }

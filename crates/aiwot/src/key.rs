@@ -1,50 +1,152 @@
-// Keys stored in `aiwot.toml`, one section each:
+// Keys stored in `aiwot.toml`:
 //
-// - `[key]`: hybrid Ed25519 + ML-DSA-44 signature key. Its public keys define
-//   the aiwot id.
-// - `[kem]`: hybrid X25519MLKEM768 key encapsulation key.
+// [key]
+// algorithm = "MlDsa65Ed25519+MlKem768X25519"
+// aiwot = "..."             # OpenPGP fingerprint of the primary key, hex
+// secret_key = """
+// -----BEGIN PGP PRIVATE KEY BLOCK-----
+// ...
+// -----END PGP PRIVATE KEY BLOCK-----
+// """
+//
+// One OpenPGP v6 key: a MlDsa65Ed25519 primary (signing and certifying) with
+// a MlKem768X25519 encryption subkey. The primary key's OpenPGP fingerprint
+// is the aiwot id.
+//
+// This uses rpgp's `draft-pqc` feature, which implements the post-quantum
+// composite algorithms of draft-ietf-openpgp-pqc. That draft, and rpgp's
+// implementation of it, are not yet stable: upstream marks `draft-pqc`
+// experimental and not for production use, so the on-wire format may still
+// change before the draft is finalized.
 //
 // The file is created by `aiwot init`, and never generated implicitly. Other
 // settings in the file are preserved.
 
-mod kem;
-mod signing;
-
 use std::path::Path;
 
-pub use kem::{encapsulate, KemKey};
-pub use signing::SigningKey;
-pub(crate) use signing::{aiwot, verify as verify_signature};
+use pgp::{
+    composed::{
+        Deserializable, EncryptionCaps, KeyType, SecretKeyParamsBuilder, SignedPublicKey,
+        SignedPublicSubKey, SignedSecretKey, SignedSecretSubKey, SubkeyParamsBuilder,
+    },
+    types::{KeyDetails, KeyVersion},
+};
+use rand::rngs::OsRng;
+use serde::{Deserialize, Serialize};
 
 pub type Error = Box<dyn std::error::Error>;
 
-/// A key stored in its own section of `aiwot.toml`.
-trait Section: Sized {
-    /// Section name in `aiwot.toml`.
-    const NAME: &'static str;
+const NAME: &str = "key";
+const ALGORITHM: &str = "MlDsa65Ed25519+MlKem768X25519";
 
-    /// Generates a new key from the OS random number generator.
-    fn generate() -> Result<Self, Error>;
-
-    /// Restores a key, checking that the stored values are consistent.
-    fn from_toml(value: toml::Value) -> Result<Self, Error>;
-
-    fn to_toml(&self) -> Result<toml::Value, Error>;
+/// The `[key]` section of `aiwot.toml`.
+#[derive(Serialize, Deserialize)]
+struct KeyConfig {
+    algorithm: String,
+    /// Derived from the secret key. Added on load if missing.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    aiwot: Option<String>,
+    secret_key: String,
 }
 
-/// The keys of this aiwot instance.
+/// The keys of this aiwot instance: one OpenPGP key, a `MlDsa65Ed25519`
+/// primary (signing and certifying) with a `MlKem768X25519` encryption
+/// subkey.
 pub struct Keys {
-    pub signing: SigningKey,
-    pub kem: KemKey,
+    pub secret: SignedSecretKey,
+}
+
+impl Keys {
+    /// The aiwot id: the hex encoded OpenPGP fingerprint of the primary key.
+    pub fn aiwot(&self) -> String {
+        aiwot(&self.secret)
+    }
+
+    /// The public key: the primary key and the encryption subkey, without any
+    /// secret material.
+    pub fn public(&self) -> SignedPublicKey {
+        self.secret.to_public_key()
+    }
+
+    /// The `MlKem768X25519` encryption subkey.
+    pub fn encryption_subkey(&self) -> Result<SignedPublicSubKey, Error> {
+        // `generate()` only populates `secret_subkeys`; the public form of
+        // each subkey is derived on demand, as `to_public_key()` also does.
+        self.secret
+            .secret_subkeys
+            .first()
+            .map(SignedSecretSubKey::signed_public_key)
+            .ok_or_else(|| "the key has no encryption subkey".into())
+    }
+
+    fn generate() -> Result<Self, Error> {
+        let params = SecretKeyParamsBuilder::default()
+            .version(KeyVersion::V6)
+            .key_type(KeyType::MlDsa65Ed25519)
+            .can_sign(true)
+            .can_certify(true)
+            .passphrase(None)
+            .subkey(
+                SubkeyParamsBuilder::default()
+                    .version(KeyVersion::V6)
+                    .key_type(KeyType::MlKem768X25519)
+                    .can_encrypt(EncryptionCaps::All)
+                    .passphrase(None)
+                    .build()?,
+            )
+            .build()?;
+
+        let secret = params.generate(OsRng)?;
+        secret.verify_bindings()?;
+
+        Ok(Self { secret })
+    }
+
+    fn from_toml(value: toml::Value) -> Result<Self, Error> {
+        let config: KeyConfig = value.try_into()?;
+        if config.algorithm != ALGORITHM {
+            return Err(format!(
+                "unsupported algorithm `{}`, expected `{ALGORITHM}`",
+                config.algorithm
+            )
+            .into());
+        }
+
+        let (secret, _) = SignedSecretKey::from_string(&config.secret_key)
+            .map_err(|e| format!("invalid secret_key: {e}"))?;
+        secret
+            .verify_bindings()
+            .map_err(|e| format!("invalid secret key: {e}"))?;
+
+        let keys = Self { secret };
+        if let Some(aiwot) = &config.aiwot {
+            if !aiwot.eq_ignore_ascii_case(&keys.aiwot()) {
+                return Err("aiwot does not match the secret key".into());
+            }
+        }
+
+        Ok(keys)
+    }
+
+    fn to_toml(&self) -> Result<toml::Value, Error> {
+        Ok(toml::Value::try_from(KeyConfig {
+            algorithm: ALGORITHM.to_string(),
+            aiwot: Some(self.aiwot()),
+            secret_key: self.secret.to_armored_string(Default::default())?,
+        })?)
+    }
+}
+
+/// The aiwot id of an OpenPGP key: the hex encoded fingerprint of its primary
+/// key.
+pub fn aiwot(key: &SignedSecretKey) -> String {
+    key.primary_key.fingerprint().to_string()
 }
 
 /// Generates new keys and stores them in a new config file. Fails if the file
 /// already exists, so keys are never overwritten.
 pub fn create(path: &Path) -> Result<Keys, Error> {
-    let keys = Keys {
-        signing: SigningKey::generate()?,
-        kem: KemKey::generate()?,
-    };
+    let keys = Keys::generate()?;
     store(path, &keys, toml::Table::new())?;
 
     Ok(keys)
@@ -54,8 +156,7 @@ pub fn create(path: &Path) -> Result<Keys, Error> {
 /// already exists, so keys are never overwritten.
 pub fn store(path: &Path, keys: &Keys, settings: toml::Table) -> Result<(), Error> {
     let mut config = settings;
-    config.insert(SigningKey::NAME.to_string(), keys.signing.to_toml()?);
-    config.insert(KemKey::NAME.to_string(), keys.kem.to_toml()?);
+    config.insert(NAME.to_string(), keys.to_toml()?);
     write_private(path, &toml::to_string(&config)?, true).map_err(|e| {
         if e.kind() == std::io::ErrorKind::AlreadyExists {
             format!(
@@ -71,8 +172,8 @@ pub fn store(path: &Path, keys: &Keys, settings: toml::Table) -> Result<(), Erro
     Ok(())
 }
 
-/// Loads the keys from the config file. Rewrites a section if its stored
-/// form is outdated (e.g. a derived field is missing).
+/// Loads the keys from the config file. Rewrites the `[key]` section if its
+/// stored form is outdated (e.g. a derived field is missing).
 pub fn load(path: &Path) -> Result<Keys, Error> {
     let mut config: toml::Table = match std::fs::read_to_string(path) {
         Ok(content) => content
@@ -88,59 +189,29 @@ pub fn load(path: &Path) -> Result<Keys, Error> {
         Err(e) => return Err(e.into()),
     };
 
-    let mut changed = false;
-    let signing = section::<SigningKey>(&mut config, &mut changed)
-        .map_err(|e| format!("invalid [{}] in {}: {e}", SigningKey::NAME, path.display()))?;
-    let kem = section::<KemKey>(&mut config, &mut changed)
-        .map_err(|e| format!("invalid [{}] in {}: {e}", KemKey::NAME, path.display()))?;
+    let value = config.get(NAME).cloned().ok_or_else(|| {
+        format!(
+            "invalid {}: missing [{NAME}] section (this looks like an aiwot.toml from before \
+             the switch to OpenPGP keys; run `aiwot init` with a new config file)",
+            path.display()
+        )
+    })?;
+    let keys = Keys::from_toml(value)
+        .map_err(|e| format!("invalid [{NAME}] in {}: {e}", path.display()))?;
 
-    if changed {
+    let stored = keys.to_toml()?;
+    if config.get(NAME) != Some(&stored) {
+        config.insert(NAME.to_string(), stored);
         write_private(path, &toml::to_string(&config)?, false)?;
     }
 
-    Ok(Keys { signing, kem })
+    Ok(keys)
 }
 
-/// Loads a section, which must exist. Updates it in `config` if its stored
-/// form is outdated.
-fn section<T: Section>(config: &mut toml::Table, changed: &mut bool) -> Result<T, Error> {
-    let key = T::from_toml(config.get(T::NAME).ok_or("missing section")?.clone())?;
-
-    let value = key.to_toml()?;
-    if config.get(T::NAME) != Some(&value) {
-        config.insert(T::NAME.to_string(), value);
-        *changed = true;
-    }
-
-    Ok(key)
-}
-
-fn decode_hex<const N: usize>(name: &str, value: &str) -> Result<[u8; N], Error> {
-    hex::decode(value)
-        .map_err(|e| format!("{name}: {e}"))?
-        .try_into()
-        .map_err(|_| format!("{name} must be {N} bytes").into())
-}
-
-/// Checks that a stored public value matches the one derived from the secret.
-fn check_public(name: &str, stored: &str, derived: &[u8]) -> Result<(), Error> {
-    if !stored.eq_ignore_ascii_case(&hex::encode(derived)) {
-        return Err(format!("{name} does not match the secret key").into());
-    }
-
-    Ok(())
-}
-
-/// A new random signing key.
+/// A new random pair of keys.
 #[cfg(test)]
-pub fn test_signing_key() -> SigningKey {
-    SigningKey::generate().unwrap()
-}
-
-/// A new random key encapsulation key.
-#[cfg(test)]
-pub fn test_kem_key() -> KemKey {
-    KemKey::generate().unwrap()
+pub fn test_keys() -> Keys {
+    Keys::generate().unwrap()
 }
 
 /// Writes a file readable only by the owner. With `create_new`, fails if the
@@ -179,14 +250,13 @@ mod tests {
 
         let keys = create(&path).unwrap();
         let loaded = load(&path).unwrap();
-        assert_eq!(loaded.signing.aiwot(), keys.signing.aiwot());
-        assert_eq!(loaded.kem.public(), keys.kem.public());
+        assert_eq!(loaded.aiwot(), keys.aiwot());
 
         // Existing keys are never overwritten.
         assert!(create(&path).is_err());
-        assert_eq!(load(&path).unwrap().signing.aiwot(), keys.signing.aiwot());
+        assert_eq!(load(&path).unwrap().aiwot(), keys.aiwot());
 
-        // Other settings are preserved when a section is updated.
+        // Other settings are preserved when the section is updated.
         let mut config: toml::Table = std::fs::read_to_string(&path).unwrap().parse().unwrap();
         config.insert("other".to_string(), toml::Value::Integer(1));
         config["key"].as_table_mut().unwrap().remove("aiwot");
@@ -194,23 +264,18 @@ mod tests {
         load(&path).unwrap();
         let config: toml::Table = std::fs::read_to_string(&path).unwrap().parse().unwrap();
         assert_eq!(config["other"].as_integer(), Some(1));
-        assert_eq!(
-            config["key"]["aiwot"].as_str(),
-            Some(keys.signing.aiwot().as_str())
-        );
+        assert_eq!(config["key"]["aiwot"].as_str(), Some(keys.aiwot().as_str()));
 
         // A missing section is an error, not regenerated.
-        let mut without_kem = config.clone();
-        without_kem.remove("kem");
-        std::fs::write(&path, toml::to_string(&without_kem).unwrap()).unwrap();
+        let mut without_key = config.clone();
+        without_key.remove("key");
+        std::fs::write(&path, toml::to_string(&without_key).unwrap()).unwrap();
         assert!(load(&path).is_err());
 
-        // A tampered public key is rejected.
-        std::fs::write(&path, toml::to_string(&config).unwrap()).unwrap();
-        let tampered = std::fs::read_to_string(&path).unwrap().replace(
-            &hex::encode(keys.signing.ed25519_public()),
-            &"00".repeat(32),
-        );
+        // A tampered aiwot id is rejected.
+        let tampered = std::fs::read_to_string(&path)
+            .unwrap()
+            .replace(&keys.aiwot(), &"0".repeat(keys.aiwot().len()));
         std::fs::write(&path, tampered).unwrap();
         assert!(load(&path).is_err());
 

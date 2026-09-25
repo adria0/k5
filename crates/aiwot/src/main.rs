@@ -1,5 +1,5 @@
 // aiwot command line: notarize and keysign attestations of aiwot profiles,
-// sign messages with the hybrid post-quantum key, and verify both.
+// sign messages with the OpenPGP post-quantum key, and verify both.
 //
 // Attestations live in `attestations`: TLSNotary (with its platform plugins
 // for X, GitHub and websites) and key sign party.
@@ -15,13 +15,13 @@ mod signcrypt;
 use clap::{Args, Parser, Subcommand};
 
 use attestations::{keysignparty, tlsnotary, Attested};
-use message::SignedMessage;
+use key::Keys;
 
 const DEFAULT_NOTARY_KEY: &str =
     "02f37514ced12c58460456a07b42042894f413ff63f9a3f0824fbe86e6c7da6764";
 
 #[derive(Parser, Debug)]
-#[command(version, about = "Notarize profiles with a remote TLSNotary server, and sign and verify messages with a hybrid post-quantum key", long_about = None)]
+#[command(version, about = "Notarize profiles with a remote TLSNotary server, and sign and verify messages with an OpenPGP post-quantum key", long_about = None)]
 struct Cli {
     /// Configuration file with the keys, created by `init`.
     #[clap(long, global = true, default_value = "aiwot.toml")]
@@ -32,9 +32,9 @@ struct Cli {
 
 #[derive(Subcommand, Debug)]
 enum Command {
-    /// Create the configuration file with new keys: a hybrid Ed25519 +
-    /// ML-DSA-44 signature key and a hybrid X25519MLKEM768 key encapsulation
-    /// key. Fails if the file already exists.
+    /// Create the configuration file with a new OpenPGP key: a MlDsa65Ed25519
+    /// signing key with a MlKem768X25519 encryption subkey (post-quantum
+    /// composite algorithms). Fails if the file already exists.
     Init,
     /// Print your aiwot.
     Me,
@@ -96,12 +96,12 @@ struct MsgArgs {
 
 #[derive(Subcommand, Debug)]
 enum MsgCommand {
-    /// Sign a message with the hybrid Ed25519 + ML-DSA-44 key, printing the
-    /// signed message and writing it to a file.
+    /// Sign a message with the MlDsa65Ed25519 signing key, printing the
+    /// OpenPGP signed message and writing it to a file.
     Sign(SignArgs),
-    /// Sign a message and encrypt it to an aiwot, using the X25519MLKEM768 key
-    /// of its self attestation in `db/attestations/`. Prints the signcrypted
-    /// message and writes it to a file.
+    /// Sign a message and encrypt it to an aiwot, using the MlKem768X25519
+    /// encryption subkey of its self attestation in `db/attestations/`.
+    /// Prints the signcrypted OpenPGP message and writes it to a file.
     Signcrypt(SigncryptArgs),
     /// Verify a signed message (listing the verified attestations of the
     /// signer found in `db/attestations/`), decrypt and verify a signcrypted
@@ -280,8 +280,8 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     };
     if let Command::Init = cli.command {
         eprintln!(
-            "Created hybrid Ed25519 + ML-DSA-44 signature key and hybrid X25519MLKEM768 key \
-             encapsulation key in {}",
+            "Created OpenPGP key (MlDsa65Ed25519 signing key with a MlKem768X25519 encryption \
+             subkey) in {}",
             cli.config.display()
         );
     }
@@ -292,7 +292,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     match cli.command {
         Command::Init => Ok(()),
         Command::Me => {
-            println!("{}", keys.signing.aiwot());
+            println!("{}", keys.aiwot());
             Ok(())
         }
         Command::Attest(AttestArgs { command }) => match command {
@@ -300,15 +300,15 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             AttestCommand::List(args) => run_list(&args).await,
             AttestCommand::Search(args) => run_search(&args).await,
             AttestCommand::Audit(args) => run_audit(&args).await,
-            AttestCommand::Export(args) => run_export(&args, &keys.signing).await,
-            AttestCommand::Merge(args) => run_merge(&args, &keys.signing.aiwot()).await,
-            AttestCommand::Keysign(args) => run_keysign(&args, &keys.signing).await,
+            AttestCommand::Export(args) => run_export(&args, &keys).await,
+            AttestCommand::Merge(args) => run_merge(&args, &keys.aiwot()).await,
+            AttestCommand::Keysign(args) => run_keysign(&args, &keys).await,
         },
-        Command::Makedot(args) => run_makedot(&args, &keys.signing.aiwot()).await,
-        Command::Fakegraph(args) => run_fakegraph(&args, &keys.signing).await,
+        Command::Makedot(args) => run_makedot(&args, &keys.aiwot()).await,
+        Command::Fakegraph(args) => run_fakegraph(&args, &keys).await,
         Command::Msg(MsgArgs { command }) => match command {
-            MsgCommand::Sign(args) => run_sign(&args, &keys.signing).await,
-            MsgCommand::Signcrypt(args) => run_signcrypt(&args, &keys.signing).await,
+            MsgCommand::Sign(args) => run_sign(&args, &keys).await,
+            MsgCommand::Signcrypt(args) => run_signcrypt(&args, &keys).await,
             MsgCommand::Verify(args) => run_verify(&args, &keys).await,
         },
         #[cfg(feature = "zkemail")]
@@ -445,14 +445,11 @@ async fn run_audit(args: &ListArgs) -> Result<(), Box<dyn std::error::Error>> {
     Ok(())
 }
 
-async fn run_export(
-    args: &ExportArgs,
-    key: &key::SigningKey,
-) -> Result<(), Box<dyn std::error::Error>> {
-    let (markdown, count) = attestations::export::create(key, &args.notary_key).await?;
+async fn run_export(args: &ExportArgs, keys: &Keys) -> Result<(), Box<dyn std::error::Error>> {
+    let (markdown, count) = attestations::export::create(keys, &args.notary_key).await?;
 
     // Check the output before handing it out.
-    SignedMessage::parse(&markdown)?.verify()?;
+    message::verify(&markdown, &attestations::keyring().await?)?;
 
     tokio::fs::write(&args.out, &markdown).await?;
     eprintln!("Exported {count} attestations");
@@ -513,13 +510,13 @@ async fn run_merge(args: &MergeArgs, me: &str) -> Result<(), Box<dyn std::error:
 
 async fn run_fakegraph(
     args: &FakegraphArgs,
-    key: &key::SigningKey,
+    keys: &Keys,
 ) -> Result<(), Box<dyn std::error::Error>> {
     let seed = match &args.seed {
         Some(seed) => fakegraph::parse_seed(seed)?,
         None => fakegraph::DEFAULT_SEED,
     };
-    let summary = fakegraph::run(key, args.n, seed).await?;
+    let summary = fakegraph::run(keys, args.n, seed).await?;
 
     println!(
         "Generated {} identities in {}/ from seed {seed:#x} ({} already existed)",
@@ -562,7 +559,7 @@ async fn run_fakegraph(
     println!(
         "Audit OK: all identities match the seed, all attestations verify and are fake, and \
          all identities are reachable from aiwot:{}",
-        key.aiwot()
+        keys.aiwot()
     );
 
     Ok(())
@@ -585,18 +582,14 @@ async fn run_makedot(args: &MakedotArgs, me: &str) -> Result<(), Box<dyn std::er
     Ok(())
 }
 
-async fn run_sign(
-    args: &SignArgs,
-    key: &key::SigningKey,
-) -> Result<(), Box<dyn std::error::Error>> {
-    let signed = SignedMessage::sign(key, &args.msg)?;
-    let markdown = signed.to_markdown();
+async fn run_sign(args: &SignArgs, keys: &Keys) -> Result<(), Box<dyn std::error::Error>> {
+    let armored = message::sign(&keys.secret, &args.msg)?;
 
     // Check the output before handing it out.
-    SignedMessage::parse(&markdown)?.verify()?;
+    message::verify(&armored, &attestations::keyring().await?)?;
 
-    print!("{markdown}");
-    tokio::fs::write(&args.out, &markdown).await?;
+    print!("{armored}");
+    tokio::fs::write(&args.out, &armored).await?;
     eprintln!("Signed message written to {}", args.out);
 
     Ok(())
@@ -604,13 +597,13 @@ async fn run_sign(
 
 /// Verifies a signed message and lists the attestations of its signer.
 async fn verify_msg(content: &str, notary_key: &str) -> Result<(), Box<dyn std::error::Error>> {
-    let signed = SignedMessage::parse(content)?;
-    signed.verify()?;
+    let keyring = attestations::keyring().await?;
+    let signed = message::verify(content, &keyring)?;
 
     println!("Valid signature from aiwot:{}", signed.from);
 
     if attestations::export::is_export(&signed.msg) {
-        let checked = attestations::export::verify(&signed.msg, notary_key)?;
+        let checked = attestations::export::verify(&signed.msg, notary_key).await?;
         println!("Export of {} attestations:", checked.len());
         for checked in &checked {
             match &checked.result {
@@ -639,31 +632,29 @@ async fn print_attested_by(
     Ok(())
 }
 
-async fn run_keysign(
-    args: &KeysignArgs,
-    key: &key::SigningKey,
-) -> Result<(), Box<dyn std::error::Error>> {
+async fn run_keysign(args: &KeysignArgs, keys: &Keys) -> Result<(), Box<dyn std::error::Error>> {
+    let keyring = attestations::keyring().await?;
     println!(
         "{}",
-        keysignparty::attest(key, &args.aiwot, &args.name).await?
+        keysignparty::attest(keys, &args.aiwot, &args.name, &keyring).await?
     );
 
     Ok(())
 }
 
-async fn run_verify(args: &VerifyArgs, keys: &key::Keys) -> Result<(), Box<dyn std::error::Error>> {
+async fn run_verify(args: &VerifyArgs, keys: &Keys) -> Result<(), Box<dyn std::error::Error>> {
     let content = tokio::fs::read_to_string(&args.file).await?;
 
-    if content.starts_with("# from") {
+    if content.starts_with("-----BEGIN PGP SIGNED MESSAGE-----") {
         verify_msg(&content, &args.notary_key).await
-    } else if content.starts_with("# to") {
+    } else if content.starts_with("-----BEGIN PGP MESSAGE-----") {
         verify_signcrypted(&content, keys, &args.notary_key).await
     } else if content.starts_with("# info") {
-        verify_attestation(&content, &args.notary_key)
+        verify_attestation(&content, &args.notary_key).await
     } else {
         Err(format!(
-            "{} is neither a signed message (`# from`), a signcrypted message (`# to`) nor an \
-             attestation record (`# info`)",
+            "{} is neither a signed message, a signcrypted message nor an attestation record \
+             (`# info`)",
             args.file
         )
         .into())
@@ -672,11 +663,11 @@ async fn run_verify(args: &VerifyArgs, keys: &key::Keys) -> Result<(), Box<dyn s
 
 async fn run_signcrypt(
     args: &SigncryptArgs,
-    key: &key::SigningKey,
+    keys: &Keys,
 ) -> Result<(), Box<dyn std::error::Error>> {
-    let to_kem = signcrypt::recipient_kem(&args.aiwot).await?;
+    let to_key = signcrypt::recipient_encryption_key(&args.aiwot).await?;
     let to = signcrypt::recipient_aiwot(&args.aiwot);
-    let sealed = signcrypt::seal(key, &to, &to_kem, &args.msg)?;
+    let sealed = signcrypt::seal(keys, &to, &to_key, &args.msg)?;
 
     print!("{sealed}");
     tokio::fs::write(&args.out, &sealed).await?;
@@ -689,23 +680,28 @@ async fn run_signcrypt(
 /// attestations of its sender.
 async fn verify_signcrypted(
     content: &str,
-    keys: &key::Keys,
+    keys: &Keys,
     notary_key: &str,
 ) -> Result<(), Box<dyn std::error::Error>> {
-    let opened = signcrypt::open(&keys.kem, &keys.signing.aiwot(), content)?;
+    let keyring = attestations::keyring().await?;
+    let opened = signcrypt::open(keys, content, &keyring)?;
 
-    println!("Decrypted message for aiwot:{}", keys.signing.aiwot());
-    println!("Valid signature from aiwot:{}", opened.signed.from);
+    println!("Decrypted message for aiwot:{}", keys.aiwot());
+    println!("Valid signature from aiwot:{}", opened.from);
     println!("# msg\n{}", opened.msg);
 
-    print_attested_by(&opened.signed.from, notary_key).await
+    print_attested_by(&opened.from, notary_key).await
 }
 
 /// Verifies an attestation record and prints its profile (and signer for key
 /// sign party attestations), or the full transcript if no plugin handles a
 /// TLSNotary record.
-fn verify_attestation(record: &str, notary_key: &str) -> Result<(), Box<dyn std::error::Error>> {
-    let attested = attestations::verify(record, notary_key)?;
+async fn verify_attestation(
+    record: &str,
+    notary_key: &str,
+) -> Result<(), Box<dyn std::error::Error>> {
+    let keyring = attestations::keyring().await?;
+    let attested = attestations::verify(record, notary_key, &keyring)?;
     let fake = if attested.is_fake() { " [fake]" } else { "" };
     let verified = match attested {
         Attested::Tlsn(verified) => verified,
@@ -719,10 +715,9 @@ fn verify_attestation(record: &str, notary_key: &str) -> Result<(), Box<dyn std:
         }
         Attested::Me(me) => {
             println!(
-                "{} kem:{} sha256:{}{fake}",
+                "{} encryption_subkey:{}{fake}",
                 me.profile(),
-                me.kem_algorithm(),
-                me.kem_fingerprint()
+                me.encryption_fingerprint().unwrap_or_default(),
             );
             return Ok(());
         }

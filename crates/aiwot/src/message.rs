@@ -1,140 +1,110 @@
-// Signed messages, stored as markdown:
+// Signed messages: the OpenPGP Cleartext Signature Framework
+// (`-----BEGIN PGP SIGNED MESSAGE-----`).
 //
-// # from
-// <aiwot id of the signer>
-// # msg
-// <the message>
-// # pbk
-// <hybrid public key, base58, 100 characters per line>
-// # signature
-// <hybrid signature of the message, base58, 100 characters per line>
+// A signed message carries no public key: verifying it resolves the signer's
+// public key by the fingerprint in the signature from a [`Keyring`], as a
+// real PGP keyring would. Verifying a message from an aiwot whose self
+// attestation has not been fetched into the keyring fails.
 
-use crate::key::{self, SigningKey};
+use std::collections::HashMap;
+
+use pgp::{
+    composed::{CleartextSignedMessage, SignedPublicKey, SignedSecretKey},
+    types::Password,
+};
+use rand::rngs::OsRng;
 
 pub type Error = Box<dyn std::error::Error>;
 
-/// Maximum length of the base58 lines.
-const LINE_WIDTH: usize = 100;
+/// Public keys of known signers, by aiwot id (OpenPGP fingerprint).
+pub type Keyring = HashMap<String, SignedPublicKey>;
 
-pub struct SignedMessage {
+/// A verified signed message.
+pub struct Verified {
+    /// The aiwot id of the signer.
     pub from: String,
     pub msg: String,
-    pub public: Vec<u8>,
-    pub signature: Vec<u8>,
 }
 
-impl SignedMessage {
-    /// Signs `msg` with `key`.
-    pub fn sign(key: &SigningKey, msg: &str) -> Result<Self, Error> {
-        Ok(Self {
-            from: key.aiwot(),
-            msg: msg.to_string(),
-            public: key.public(),
-            signature: key.sign(msg.as_bytes())?,
-        })
-    }
+/// Signs `msg` with `key`, returning the armored cleartext-signed message.
+pub fn sign(key: &SignedSecretKey, msg: &str) -> Result<String, Error> {
+    let signed = CleartextSignedMessage::sign(OsRng, msg, &key.primary_key, &Password::empty())?;
 
-    /// Checks that `from` is the aiwot id of the public key and that the
-    /// signature of the message is valid.
-    pub fn verify(&self) -> Result<(), Error> {
-        let aiwot = key::aiwot(&self.public);
-        if !self.from.eq_ignore_ascii_case(&aiwot) {
-            return Err(format!(
-                "`from` {} is not the aiwot of the public key ({aiwot})",
-                self.from
-            )
-            .into());
-        }
-
-        key::verify_signature(self.msg.as_bytes(), &self.public, &self.signature)
-    }
-
-    pub fn to_markdown(&self) -> String {
-        format!(
-            "# from\n{}\n# msg\n{}\n# pbk\n{}\n# signature\n{}\n",
-            self.from,
-            self.msg,
-            encode(&self.public),
-            encode(&self.signature)
-        )
-    }
-
-    pub fn parse(markdown: &str) -> Result<Self, Error> {
-        // The message may contain anything, so the sections around it are
-        // located from the outside in. Base58 never contains `#`.
-        let rest = markdown
-            .strip_prefix("# from\n")
-            .ok_or("missing `# from` section")?;
-        let (from, rest) = rest
-            .split_once("\n# msg\n")
-            .ok_or("missing `# msg` section")?;
-        let (rest, signature) = rest
-            .rsplit_once("\n# signature\n")
-            .ok_or("missing `# signature` section")?;
-        let (msg, public) = rest
-            .rsplit_once("\n# pbk\n")
-            .ok_or("missing `# pbk` section")?;
-
-        Ok(Self {
-            from: from.trim().to_string(),
-            msg: msg.to_string(),
-            public: decode("pbk", public)?,
-            signature: decode("signature", signature)?,
-        })
-    }
+    Ok(signed.to_armored_string(Default::default())?)
 }
 
-/// Encodes as base58 in lines of at most [`LINE_WIDTH`] characters.
-pub fn encode(data: &[u8]) -> String {
-    let encoded = bs58::encode(data).into_string();
+/// Verifies an armored cleartext-signed message, resolving the signer's
+/// public key from `keyring` by the fingerprint carried in the signature.
+pub fn verify(armored: &str, keyring: &Keyring) -> Result<Verified, Error> {
+    let (signed, _) = CleartextSignedMessage::from_string(armored)?;
+    let signature = signed
+        .signatures()
+        .first()
+        .ok_or("signed message has no signature")?;
+    let from = signature
+        .issuer_fingerprint()
+        .first()
+        .ok_or("signature has no issuer fingerprint")?
+        .to_string();
 
-    encoded
-        .as_bytes()
-        .chunks(LINE_WIDTH)
-        .map(|line| std::str::from_utf8(line).expect("base58 is ascii"))
-        .collect::<Vec<_>>()
-        .join("\n")
-}
+    let public = keyring
+        .get(&from)
+        .ok_or_else(|| format!("unknown signer aiwot:{from}: fetch its self attestation first"))?;
+    signed.verify(public)?;
 
-/// Decodes base58 split in lines.
-pub fn decode(name: &str, section: &str) -> Result<Vec<u8>, Error> {
-    let encoded: String = section.split_whitespace().collect();
-
-    bs58::decode(encoded)
-        .into_vec()
-        .map_err(|e| format!("invalid base58 in `# {name}`: {e}").into())
+    // `signed_text` normalizes line endings to CRLF for hashing; every
+    // statement in this codebase is authored with plain `\n`.
+    Ok(Verified {
+        from,
+        msg: signed.signed_text().replace("\r\n", "\n"),
+    })
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::key::test_signing_key;
+    use crate::key::test_keys;
+
+    fn keyring_of(keys: &crate::key::Keys) -> Keyring {
+        Keyring::from([(keys.aiwot(), keys.public())])
+    }
 
     #[test]
     fn test_round_trip() {
-        let key = test_signing_key();
-        let signed = SignedMessage::sign(&key, "hello\n# pbk\nworld").unwrap();
+        let keys = test_keys();
+        let keyring = keyring_of(&keys);
 
-        let markdown = signed.to_markdown();
-        assert!(markdown.lines().all(|line| line.len() <= LINE_WIDTH));
+        let armored = sign(&keys.secret, "hello\nworld").unwrap();
+        assert!(armored.starts_with("-----BEGIN PGP SIGNED MESSAGE-----"));
 
-        let parsed = SignedMessage::parse(&markdown).unwrap();
-        assert_eq!(parsed.from, key.aiwot());
-        assert_eq!(parsed.msg, "hello\n# pbk\nworld");
-        parsed.verify().unwrap();
+        let verified = verify(&armored, &keyring).unwrap();
+        assert_eq!(verified.from, keys.aiwot());
+        assert_eq!(verified.msg, "hello\nworld");
+    }
+
+    #[test]
+    fn test_unknown_signer() {
+        let keys = test_keys();
+        let armored = sign(&keys.secret, "hello").unwrap();
+
+        // Without the signer's key in the keyring, verification fails.
+        assert!(verify(&armored, &Keyring::new()).is_err());
     }
 
     #[test]
     fn test_tampering() {
-        let key = test_signing_key();
-        let markdown = SignedMessage::sign(&key, "hello").unwrap().to_markdown();
+        let keys = test_keys();
+        let keyring = keyring_of(&keys);
+        let armored = sign(&keys.secret, "hello").unwrap();
 
-        let tampered = markdown.replace("\nhello\n", "\nhellO\n");
-        assert!(SignedMessage::parse(&tampered).unwrap().verify().is_err());
+        let tampered = armored.replace("hello", "hellO");
+        assert!(verify(&tampered, &keyring).is_err());
 
-        let other = test_signing_key();
-        let mut signed = SignedMessage::parse(&markdown).unwrap();
-        signed.from = other.aiwot();
-        assert!(signed.verify().is_err());
+        // Signed by someone else than claimed: verification against the
+        // wrong keyring entry fails.
+        let other = test_keys();
+        let mut mixed = Keyring::new();
+        mixed.insert(keys.aiwot(), other.public());
+        assert!(verify(&armored, &mixed).is_err());
     }
 }

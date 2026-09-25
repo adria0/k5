@@ -21,14 +21,16 @@
 
 use std::collections::{HashMap, HashSet};
 
-use super::{check, keysignparty, Error, ProfileAttestation, DIR};
+use super::{check, keyring, keysignparty, Error, ProfileAttestation, DIR};
 use crate::{
-    key::SigningKey,
-    message::{self, SignedMessage},
+    key::Keys,
+    message::{self, Keyring},
 };
 
 const HEADER: &str = "aiwot export";
 const ATTESTATION_PREFIX: &str = "attestation:";
+/// Maximum length of the base58 lines.
+const LINE_WIDTH: usize = 100;
 
 /// An attestation record in an export.
 pub struct Exported {
@@ -41,7 +43,7 @@ type VerifiedExport = (Exported, Result<ProfileAttestation, String>);
 /// Creates a signed export of the valid attestations in [`DIR`], returning
 /// the signed message markdown and the number of exported attestations.
 /// Invalid records are reported and skipped.
-pub async fn create(key: &SigningKey, notary_key: &str) -> Result<(String, usize), Error> {
+pub async fn create(keys: &Keys, notary_key: &str) -> Result<(String, usize), Error> {
     let mut exported = Vec::new();
     for checked in check(None, notary_key).await? {
         match checked.result {
@@ -57,9 +59,9 @@ pub async fn create(key: &SigningKey, notary_key: &str) -> Result<(String, usize
     }
 
     let date = chrono::Utc::now().to_rfc3339_opts(chrono::SecondsFormat::Secs, true);
-    let signed = SignedMessage::sign(key, &bundle(&date, &exported))?;
+    let armored = message::sign(&keys.secret, &bundle(&date, &exported))?;
 
-    Ok((signed.to_markdown(), exported.len()))
+    Ok((armored, exported.len()))
 }
 
 /// Returns whether a signed message is an export.
@@ -69,8 +71,10 @@ pub fn is_export(msg: &str) -> bool {
 
 /// Verifies each attestation of an export, as [`check`] does for the files
 /// in [`DIR`].
-pub fn verify(msg: &str, notary_key: &str) -> Result<Vec<super::Checked>, Error> {
-    Ok(verify_all(msg, notary_key)?
+pub async fn verify(msg: &str, notary_key: &str) -> Result<Vec<super::Checked>, Error> {
+    let keyring = keyring().await?;
+
+    Ok(verify_all(msg, notary_key, &keyring)?
         .into_iter()
         .map(|(exported, result)| super::Checked {
             file: exported.file,
@@ -111,8 +115,8 @@ pub async fn merge(
     notary_key: &str,
     force: bool,
 ) -> Result<(String, Vec<Merged>), Error> {
-    let signed = SignedMessage::parse(markdown)?;
-    signed.verify()?;
+    let keyring = keyring().await?;
+    let signed = message::verify(markdown, &keyring)?;
     if !is_export(&signed.msg) {
         return Err("not an export: the signed message is not an attestation bundle".into());
     }
@@ -122,7 +126,7 @@ pub async fn merge(
         .into_iter()
         .filter_map(|checked| checked.result.ok())
         .collect();
-    let mut candidates = verify_all(&signed.msg, notary_key)?;
+    let mut candidates = verify_all(&signed.msg, notary_key, &keyring)?;
 
     let trusted = trusted(
         me,
@@ -229,21 +233,29 @@ async fn store(
 }
 
 /// Verifies each attestation of an export.
-fn verify_all(msg: &str, notary_key: &str) -> Result<Vec<VerifiedExport>, Error> {
+fn verify_all(
+    msg: &str,
+    notary_key: &str,
+    keyring: &Keyring,
+) -> Result<Vec<VerifiedExport>, Error> {
     Ok(parse(msg)?
         .into_iter()
         .map(|exported| {
-            let result = verify_one(&exported, notary_key).map_err(|e| e.to_string());
+            let result = verify_one(&exported, notary_key, keyring).map_err(|e| e.to_string());
             (exported, result)
         })
         .collect())
 }
 
-fn verify_one(exported: &Exported, notary_key: &str) -> Result<ProfileAttestation, Error> {
+fn verify_one(
+    exported: &Exported,
+    notary_key: &str,
+    keyring: &Keyring,
+) -> Result<ProfileAttestation, Error> {
     check_safe_file_name(&exported.file)?;
 
     let attestation =
-        super::verify(&exported.record, notary_key)?.attestation(exported.file.clone())?;
+        super::verify(&exported.record, notary_key, keyring)?.attestation(exported.file.clone())?;
     super::check_file_name(&exported.file, &attestation)?;
 
     Ok(attestation)
@@ -270,7 +282,7 @@ fn bundle(date: &str, exported: &[Exported]) -> String {
         bundle.push_str(&format!(
             "\n{ATTESTATION_PREFIX}{}\n{}",
             exported.file,
-            message::encode(exported.record.as_bytes())
+            encode(exported.record.as_bytes())
         ));
     }
 
@@ -319,21 +331,38 @@ fn parse(msg: &str) -> Result<Vec<Exported>, Error> {
 }
 
 fn decode((file, encoded): (String, String)) -> Result<Exported, Error> {
-    let record = String::from_utf8(message::decode(&file, &encoded)?)
-        .map_err(|_| format!("attestation {file} is not valid UTF-8"))?;
+    let record = String::from_utf8(
+        bs58::decode(&encoded)
+            .into_vec()
+            .map_err(|e| format!("invalid base58 in attestation {file}: {e}"))?,
+    )
+    .map_err(|_| format!("attestation {file} is not valid UTF-8"))?;
 
     Ok(Exported { file, record })
+}
+
+/// Encodes as base58 in lines of at most [`LINE_WIDTH`] characters.
+fn encode(data: &[u8]) -> String {
+    let encoded = bs58::encode(data).into_string();
+
+    encoded
+        .as_bytes()
+        .chunks(LINE_WIDTH)
+        .map(|line| std::str::from_utf8(line).expect("base58 is ascii"))
+        .collect::<Vec<_>>()
+        .join("\n")
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::{attestations::keysignparty, key::test_signing_key};
+    use crate::{attestations::keysignparty, key::test_keys};
 
-    #[test]
-    fn test_bundle_round_trip() {
-        let signer = test_signing_key();
-        let subject = test_signing_key().aiwot();
+    #[tokio::test]
+    async fn test_bundle_round_trip() {
+        let signer = test_keys();
+        let subject = test_keys().aiwot();
+        let keyring = Keyring::from([(signer.aiwot(), signer.public())]);
         let (file, record) = keysignparty::create(&signer, &subject, "Alice", false).unwrap();
 
         let exported = vec![
@@ -359,12 +388,12 @@ mod tests {
         assert_eq!(parsed[0].file, file);
         assert_eq!(parsed[0].record, record);
 
-        let checked = verify(&msg, "").unwrap();
+        let checked = verify_all(&msg, "", &keyring).unwrap();
         assert_eq!(
-            checked[0].result.as_ref().unwrap().to_string(),
+            checked[0].1.as_ref().unwrap().to_string(),
             format!("keysignparty:Alice (signed by aiwot:{})", signer.aiwot())
         );
-        assert!(checked[1].result.is_err());
+        assert!(checked[1].1.is_err());
 
         // A wrong count is detected.
         assert!(parse(&msg.replace("count:2", "count:3")).is_err());
@@ -372,21 +401,19 @@ mod tests {
 
     #[test]
     fn test_web_of_trust() {
-        use crate::{
-            attestations::{me, Attested},
-            key::test_kem_key,
-        };
+        use crate::attestations::{me, Attested};
 
-        let [me_key, bob, carol, dave, eve, frank] = std::array::from_fn(|_| test_signing_key());
-        let keysign = |signer: &crate::key::SigningKey, subject: &crate::key::SigningKey| {
+        let [me_key, bob, carol, dave, eve, frank] = std::array::from_fn(|_| test_keys());
+        let keysign = |signer: &Keys, subject: &Keys| {
             let (file, record) =
                 keysignparty::create(signer, &subject.aiwot(), "x", false).unwrap();
-            Attested::KeySign(keysignparty::verify(&record).unwrap())
+            let keyring = Keyring::from([(signer.aiwot(), signer.public())]);
+            Attested::KeySign(keysignparty::verify(&record, &keyring).unwrap())
                 .attestation(file)
                 .unwrap()
         };
-        let me_attestation = |key: &crate::key::SigningKey| {
-            let record = me::create(key, &test_kem_key(), false).unwrap();
+        let me_attestation = |key: &Keys| {
+            let record = me::create(key, false).unwrap();
             Attested::Me(me::verify(&record).unwrap())
                 .attestation(String::new())
                 .unwrap()
@@ -435,13 +462,14 @@ mod tests {
         assert!(check_safe_file_name(&format!("{}-self_attestation.md", "ab".repeat(32))).is_ok());
 
         // A valid record under a path escaping the directory is rejected.
-        let signer = test_signing_key();
-        let subject = test_signing_key().aiwot();
+        let signer = test_keys();
+        let subject = test_keys().aiwot();
         let (file, record) = keysignparty::create(&signer, &subject, "Alice", false).unwrap();
         let exported = Exported {
             file: format!("{subject}-../../{file}"),
             record,
         };
-        assert!(verify_one(&exported, "").is_err());
+        let keyring = Keyring::from([(signer.aiwot(), signer.public())]);
+        assert!(verify_one(&exported, "", &keyring).is_err());
     }
 }

@@ -1,7 +1,8 @@
 // Key sign party attestations.
 //
 // As in a PGP key signing party, someone you know gives you their aiwot and
-// name, and you attest it by signing a statement with your key:
+// name, and you attest it with a detached OpenPGP signature over a
+// statement:
 //
 // aiwot keysignparty
 // aiwot:<their aiwot>
@@ -9,13 +10,21 @@
 // date:<creation time, RFC 3339>
 // fake:true   (only for generated, fake attestations)
 //
-// The record is an `# info` section, for humans only, followed by the signed
-// statement in the signed message format (`# from`, `# msg`, `# pbk`,
-// `# signature`). Only the signed statement is verified. The trust in the
-// attestation is the trust in its signer.
+// The record is an `# info` section, for humans only, followed by the
+// `# statement` and its `# signature`, a detached OpenPGP signature. Only the
+// statement and signature are verified, resolving the signer's public key
+// from a [`Keyring`] by the fingerprint carried in the signature, as a real
+// PGP keyring would. The trust in the attestation is the trust in its signer.
+
+use pgp::{
+    composed::{Deserializable, DetachedSignature},
+    crypto::hash::HashAlgorithm,
+    types::Password,
+};
+use rand::rngs::OsRng;
 
 use super::{Error, Profile, DIR};
-use crate::{key::SigningKey, message::SignedMessage};
+use crate::{key::Keys, message::Keyring};
 
 /// Type of key sign party attestation records.
 pub const RECORD_TYPE: &str = "keysignparty";
@@ -47,20 +56,28 @@ impl KeySign {
 /// Creates a signed attestation that `subject` belongs to `name`, returning
 /// the record file name and content. `fake` marks generated attestations.
 pub fn create(
-    key: &SigningKey,
+    keys: &Keys,
     subject: &str,
     name: &str,
     fake: bool,
 ) -> Result<(String, String), Error> {
     let subject = parse_aiwot(subject)?;
     check_name(name)?;
-    let signer = key.aiwot();
+    let signer = keys.aiwot();
     if subject == signer {
         return Err("you cannot attest your own aiwot".into());
     }
 
     let date = chrono::Utc::now().to_rfc3339_opts(chrono::SecondsFormat::Secs, true);
-    let signed = SignedMessage::sign(key, &statement(&subject, name, &date, fake))?;
+    let statement = statement(&subject, name, &date, fake);
+    let signature = DetachedSignature::sign_text_data(
+        OsRng,
+        &keys.secret.primary_key,
+        &Password::empty(),
+        HashAlgorithm::Sha3_512,
+        statement.as_bytes(),
+    )?;
+    let armored_signature = signature.to_armored_string(Default::default())?;
 
     let keysign = KeySign {
         subject,
@@ -78,12 +95,14 @@ pub fn create(
          - Profile: {profile}\n\
          - Signed by: aiwot:{signer}\n\
          \n\
-         {signed}",
+         # statement\n\
+         {statement}\n\
+         # signature\n\
+         {armored_signature}",
         date = keysign.date,
         profile = keysign.profile(),
         signer = keysign.signer,
         fake = keysign.fake,
-        signed = signed.to_markdown(),
     );
     let file_name = format!(
         "{}-{RECORD_TYPE}-{}-{}.md",
@@ -97,11 +116,16 @@ pub fn create(
 
 /// Creates and stores in [`DIR`] an attestation that `subject` belongs to
 /// `name`, returning its path.
-pub async fn attest(key: &SigningKey, subject: &str, name: &str) -> Result<String, Error> {
-    let (file_name, record) = create(key, subject, name, false)?;
+pub async fn attest(
+    keys: &Keys,
+    subject: &str,
+    name: &str,
+    keyring: &Keyring,
+) -> Result<String, Error> {
+    let (file_name, record) = create(keys, subject, name, false)?;
 
     // Check the record before storing it.
-    verify(&record)?;
+    verify(&record, keyring)?;
 
     let path = format!("{DIR}/{file_name}");
     tokio::fs::create_dir_all(DIR).await?;
@@ -110,15 +134,29 @@ pub async fn attest(key: &SigningKey, subject: &str, name: &str) -> Result<Strin
     Ok(path)
 }
 
-/// Verifies a key sign party record.
-pub fn verify(record: &str) -> Result<KeySign, Error> {
-    let (_, signed) = record
-        .split_once("\n# from\n")
-        .ok_or("keysignparty record has no `# from` section")?;
-    let signed = SignedMessage::parse(&format!("# from\n{signed}"))?;
-    signed.verify()?;
+/// Verifies a key sign party record, resolving the signer's public key from
+/// `keyring` by the fingerprint carried in the signature.
+pub fn verify(record: &str, keyring: &Keyring) -> Result<KeySign, Error> {
+    let (_, rest) = record
+        .split_once("\n# statement\n")
+        .ok_or("keysignparty record has no `# statement` section")?;
+    let (statement, signature) = rest
+        .rsplit_once("\n# signature\n")
+        .ok_or("keysignparty record has no `# signature` section")?;
 
-    let keysign = parse_statement(&signed.msg, signed.from.to_ascii_lowercase())?;
+    let (signature, _) = DetachedSignature::from_string(signature)?;
+    let signer = signature
+        .signature
+        .issuer_fingerprint()
+        .first()
+        .ok_or("signature has no issuer fingerprint")?
+        .to_string();
+    let signer_key = keyring.get(&signer).ok_or_else(|| {
+        format!("unknown signer aiwot:{signer}: fetch its self attestation first")
+    })?;
+    signature.verify(signer_key, statement.as_bytes())?;
+
+    let keysign = parse_statement(statement, signer)?;
     if keysign.subject == keysign.signer {
         return Err("self-attestation".into());
     }
@@ -201,12 +239,17 @@ fn file_name_part(name: &str) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::key::test_signing_key;
+    use crate::key::test_keys;
+
+    fn keyring_of(keys: &Keys) -> Keyring {
+        Keyring::from([(keys.aiwot(), keys.public())])
+    }
 
     #[test]
     fn test_create_verify() {
-        let signer = test_signing_key();
-        let subject = test_signing_key().aiwot();
+        let signer = test_keys();
+        let subject = test_keys().aiwot();
+        let keyring = keyring_of(&signer);
 
         let (file_name, record) =
             create(&signer, &format!("aiwot:{subject}"), "Alice Smith", false).unwrap();
@@ -219,7 +262,7 @@ mod tests {
         );
         assert!(record.starts_with("# info\n\n- Type: keysignparty\n"));
 
-        let keysign = verify(&record).unwrap();
+        let keysign = verify(&record, &keyring).unwrap();
         assert_eq!(keysign.subject, subject);
         assert_eq!(keysign.name, "Alice Smith");
         assert_eq!(keysign.signer, signer.aiwot());
@@ -233,20 +276,23 @@ mod tests {
             "- Profile: keysignparty/Alice Smith",
             "- Profile: keysignparty/Mallory",
         );
-        assert_eq!(verify(&edited).unwrap().name, "Alice Smith");
+        assert_eq!(verify(&edited, &keyring).unwrap().name, "Alice Smith");
 
         // Editing the signed statement is detected.
         let forged = record.replace("\nname:Alice Smith\n", "\nname:Mallory\n");
-        assert!(verify(&forged).is_err());
+        assert!(verify(&forged, &keyring).is_err());
+
+        // Without the signer's key in the keyring, verification fails.
+        assert!(verify(&record, &Keyring::new()).is_err());
     }
 
     #[test]
     fn test_invalid() {
-        let signer = test_signing_key();
+        let signer = test_keys();
 
         assert!(create(&signer, &signer.aiwot(), "me", false).is_err());
         assert!(create(&signer, "abc", "Alice", false).is_err());
-        let subject = test_signing_key().aiwot();
+        let subject = test_keys().aiwot();
         assert!(create(&signer, &subject, "Alice\nname:Mallory", false).is_err());
         assert!(create(&signer, &subject, " ", false).is_err());
     }

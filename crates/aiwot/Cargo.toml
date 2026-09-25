@@ -1,7 +1,7 @@
 [package]
 edition = "2021"
 name = "aiwot"
-description = "Notarize and verify aiwot profiles with TLSNotary, and sign messages with a hybrid post-quantum key"
+description = "Notarize and verify aiwot profiles with TLSNotary, and sign messages with an OpenPGP post-quantum key"
 publish = false
 version = "0.1.0"
 
@@ -25,18 +25,18 @@ plonky2-zkemail = { path = "../plonky2-zkemail", optional = true }
 base64 = { version = "0.22" }
 bincode = { workspace = true }
 bs58 = { version = "0.5" }
-chacha20poly1305 = { version = "0.10" }
 chrono = { workspace = true }
 clap = { version = "4.5", features = ["derive"] }
-ed25519-dalek = { version = "2" }
-fips203 = { version = "0.4.3", default-features = false, features = ["ml-kem-768"] }
-fips204 = { version = "0.4.6", default-features = false, features = ["ml-dsa-44", "default-rng"] }
-getrandom = { version = "0.2" }
-hkdf = { version = "0.12" }
 hex = { workspace = true }
 http-body-util = { workspace = true }
 hyper = { workspace = true, features = ["client", "http1"] }
 hyper-util = { workspace = true, features = ["full"] }
+# `pgp` (rpgp) needs `rand` 0.8, incompatible with the workspace's `rand` 0.9
+# family used elsewhere; kept as crate-local dependencies, not
+# `{ workspace = true }`.
+pgp = { version = "0.20", features = ["draft-pqc"] }
+rand = { version = "0.8" }
+rand_chacha = { version = "0.3" }
 serde = { workspace = true, features = ["derive"] }
 serde_json = { workspace = true }
 sha2 = { workspace = true }
@@ -44,4 +44,3 @@ tokio = { workspace = true, features = ["rt", "rt-multi-thread", "macros", "net"
 tokio-util = { workspace = true, features = ["compat"] }
 toml = { workspace = true }
 tracing-subscriber = { workspace = true }
-x25519-dalek = { version = "2", features = ["static_secrets"] }

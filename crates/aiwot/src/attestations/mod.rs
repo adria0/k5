@@ -25,7 +25,7 @@ use std::fmt;
 
 use tlsnotary::plugins;
 
-use crate::parallel::parallel_map;
+use crate::{message::Keyring, parallel::parallel_map};
 
 pub type Error = Box<dyn std::error::Error>;
 
@@ -133,11 +133,13 @@ impl Attested {
                 profile: me.profile(),
                 attributes: vec![
                     ("type", me::RECORD_TYPE.to_string()),
-                    ("kem", me.kem_algorithm().to_string()),
-                    ("kem_sha256", me.kem_fingerprint()),
+                    (
+                        "encryption_subkey",
+                        me.encryption_fingerprint().unwrap_or_default(),
+                    ),
                     ("date", me.date.clone()),
                 ],
-                signer: Some(me.aiwot),
+                signer: Some(me.aiwot.clone()),
                 file,
                 fake,
             },
@@ -160,16 +162,20 @@ impl Attested {
 }
 
 /// Verifies an attestation record of any type. TLSNotary records must be
-/// signed by `notary_key`.
-pub fn verify(record: &str, notary_key: &str) -> Result<Attested, Error> {
+/// signed by `notary_key`. Records signed by another aiwot (key sign party
+/// and fake attestations) resolve the signer's public key from `keyring`, by
+/// the fingerprint carried in the signature, as a real PGP keyring would.
+pub fn verify(record: &str, notary_key: &str, keyring: &Keyring) -> Result<Attested, Error> {
     let info_fake = record_fake(record)?;
 
     // Records written before the type was added are TLSNotary records.
     let attested = match record_type(record).unwrap_or(tlsnotary::RECORD_TYPE) {
-        tlsnotary::RECORD_TYPE if info_fake == Some(true) => Attested::Fake(fake::verify(record)?),
+        tlsnotary::RECORD_TYPE if info_fake == Some(true) => {
+            Attested::Fake(fake::verify(record, keyring)?)
+        }
         tlsnotary::RECORD_TYPE => Attested::Tlsn(tlsnotary::verify(record, notary_key)?),
-        keysignparty::RECORD_TYPE => Attested::KeySign(keysignparty::verify(record)?),
-        me::RECORD_TYPE | me::LEGACY_RECORD_TYPE => Attested::Me(me::verify(record)?),
+        keysignparty::RECORD_TYPE => Attested::KeySign(keysignparty::verify(record, keyring)?),
+        me::RECORD_TYPE => Attested::Me(me::verify(record)?),
         other => return Err(format!("unsupported attestation type `{other}`").into()),
     };
 
@@ -179,6 +185,38 @@ pub fn verify(record: &str, notary_key: &str) -> Result<Attested, Error> {
     }
 
     Ok(attested)
+}
+
+/// Builds a keyring of the public keys of the self attestations in [`DIR`],
+/// by aiwot id, as a real PGP keyring would be built from fetched public
+/// keys. Invalid records are ignored: they are reported when checked as
+/// attestations in their own right.
+pub async fn keyring() -> Result<Keyring, Error> {
+    let mut entries = match tokio::fs::read_dir(DIR).await {
+        Ok(entries) => entries,
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(Keyring::new()),
+        Err(e) => return Err(e.into()),
+    };
+
+    let suffix = format!("-{}.md", me::RECORD_TYPE);
+    let mut files = Vec::new();
+    while let Some(entry) = entries.next_entry().await? {
+        let file = entry.file_name().to_string_lossy().into_owned();
+        if file.to_ascii_lowercase().ends_with(&suffix) {
+            files.push(file);
+        }
+    }
+
+    let mut keyring = Keyring::new();
+    for file in files {
+        if let Ok(record) = tokio::fs::read_to_string(format!("{DIR}/{file}")).await {
+            if let Ok(me) = me::verify(&record) {
+                keyring.insert(me.aiwot, me.public);
+            }
+        }
+    }
+
+    Ok(keyring)
 }
 
 /// Returns the `- Fake:` of an attestation record, if present.
@@ -307,20 +345,26 @@ async fn check(prefix: Option<&str>, notary_key: &str) -> Result<Vec<Checked>, E
         records.push((file, record));
     }
 
+    let keyring = keyring().await?;
+
     // Verification is CPU bound, so records are verified in parallel.
     Ok(parallel_map(&records, |(file, record)| Checked {
         file: file.clone(),
-        result: record
-            .as_ref()
-            .map_err(Clone::clone)
-            .and_then(|record| check_record(file, record, notary_key).map_err(|e| e.to_string())),
+        result: record.as_ref().map_err(Clone::clone).and_then(|record| {
+            check_record(file, record, notary_key, &keyring).map_err(|e| e.to_string())
+        }),
     }))
 }
 
 /// Verifies the record stored in `file`, whose name must start with the
 /// attested aiwot.
-fn check_record(file: &str, record: &str, notary_key: &str) -> Result<ProfileAttestation, Error> {
-    let attestation = verify(record, notary_key)?.attestation(file.to_string())?;
+fn check_record(
+    file: &str,
+    record: &str,
+    notary_key: &str,
+    keyring: &Keyring,
+) -> Result<ProfileAttestation, Error> {
+    let attestation = verify(record, notary_key, keyring)?.attestation(file.to_string())?;
     check_file_name(file, &attestation)?;
 
     Ok(attestation)
@@ -341,7 +385,10 @@ mod tests {
 
         let unknown = "# info\n\n- Type: other\n\n# binary\n\nAAAA\n";
         assert_eq!(
-            verify(unknown, "").err().unwrap().to_string(),
+            verify(unknown, "", &Keyring::new())
+                .err()
+                .unwrap()
+                .to_string(),
             "unsupported attestation type `other`"
         );
     }
