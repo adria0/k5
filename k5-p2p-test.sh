@@ -6,21 +6,36 @@
 # with a different seed each), all on its web of trust, and the attestations
 # of adria0's X, GitHub and website (notarized as in k5-test.sh, with
 # k5cli's local notary). Then makes the first contact between Alice and Bob
-# (a ticket, over n0's network) so each knows how to reach the other, and
-# opens a k5gui for each. In either window: search the other, open its
-# dossier, MESSAGES or SYNC; received messages appear in CHATS.
+# (a ticket, over n0's network) so each knows how to reach the other, checks
+# that a message from Alice reaches Bob, and opens a k5gui for each. In
+# either window: search the other, open its dossier, MESSAGES or SYNC;
+# received messages appear in CHATS.
 #
-# Usage: ./k5-p2p-test.sh [DIR]
+# With --no-gui, also checks that Alice can sync with Bob, and stops there
+# instead of opening the windows: a self-checking run (it needs n0).
+#
+# Usage: ./k5-p2p-test.sh [--no-gui] [DIR]
 
 set -euo pipefail
+
+GUI=1
+if [ "${1:-}" = "--no-gui" ]; then
+    GUI=0
+    shift
+fi
 
 ROOT="$(cd "$(dirname "$0")" && pwd)"
 DIR="$(mkdir -p "${1:-p2p-test}" && cd "${1:-p2p-test}" && pwd)"
 K5CLI="$ROOT/target/release/k5cli"
 K5GUI="$ROOT/target/release/k5gui"
 
-echo "Building k5cli and k5gui ..."
-cargo build --release --manifest-path "$ROOT/Cargo.toml" -p k5cli -p k5gui
+if [ "$GUI" = 1 ]; then
+    echo "Building k5cli and k5gui ..."
+    cargo build --release --manifest-path "$ROOT/Cargo.toml" -p k5cli -p k5gui
+else
+    echo "Building k5cli ..."
+    cargo build --release --manifest-path "$ROOT/Cargo.toml" -p k5cli
+fi
 
 rm -rf "$DIR/alice" "$DIR/bob"
 mkdir -p "$DIR/alice" "$DIR/bob"
@@ -100,15 +115,48 @@ for _ in $(seq 60); do
     sleep 0.5
 done
 if [ -z "$TICKET" ]; then
-    echo "No ticket from Bob's listener after 30s:" >&2
+    echo "No ticket from Bob's listener after 30s (is n0 reachable?):" >&2
     cat "$LISTEN_LOG" >&2
     exit 1
 fi
 
 RUST_LOG=warn cli alice p2p connect "$TICKET" 2>/dev/null
+
+# While Bob still listens: Alice finds him by his k5 (through n0) and
+# delivers a message to his inbox.
+echo "Checking a message from Alice to Bob ..."
+RUST_LOG=warn cli alice p2p send "k5:$BOB" "hello bob, from the p2p test" 2>/dev/null
+# Captured first: with pipefail, `grep -q` stopping early fails the pipe.
+INBOX="$(cli bob p2p inbox)"
+if ! grep -q "hello bob, from the p2p test" <<<"$INBOX"; then
+    echo "The message did not reach Bob's inbox:" >&2
+    cat "$LISTEN_LOG" >&2
+    exit 1
+fi
+echo "  delivered"
+
+# Syncing gives Alice Bob's identities too, so only without the windows,
+# which show each client its own.
+if [ "$GUI" = 0 ]; then
+    echo "Checking that Alice syncs with Bob ..."
+    RUST_LOG=warn cli alice p2p sync "k5:$BOB" 2>/dev/null | tail -n 3
+    LISTING="$(cli alice attest list 2>/dev/null)"
+    if ! grep -q "signer: k5:$BOB" <<<"$LISTING"; then
+        echo "Alice did not merge Bob's keysigns" >&2
+        exit 1
+    fi
+    echo "  synced"
+fi
+
 kill "$LISTENER" 2>/dev/null || true
 wait "$LISTENER" 2>/dev/null || true
 trap - EXIT
+
+if [ "$GUI" = 0 ]; then
+    echo
+    echo "All checks passed ($DIR)."
+    exit 0
+fi
 
 # Both windows at once; closing the script (Ctrl-C) closes them.
 echo "Starting both k5gui ..."

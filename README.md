@@ -37,7 +37,11 @@ k5gui                         # the desktop interface
 ```
 
 `k5cli.sh` and `k5gui.sh` run them through `cargo run --release`. `k5-test.sh`
-is an end-to-end run of most commands (it deletes `db/` first).
+is an end-to-end run of most commands, in the repository root (it deletes
+`db/` first, and stops at the first failure). `k5-p2p-test.sh` sets up two
+clients, Alice and Bob, pairs them over n0, checks a message gets through and
+opens a window for each; `k5-p2p-test.sh --no-gui` also checks sync and stops
+there, as a self-checking run.
 
 ## Attestations
 

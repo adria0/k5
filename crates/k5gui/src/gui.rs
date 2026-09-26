@@ -19,6 +19,11 @@
 // remote TLSNotary notary, given on the command line: the page that shows the
 // k5 is notarized and stored as an attestation.
 //
+// Operations that take a while (notarizing, syncing, connecting,
+// delivering, making a ticket, verifying) run in the background, on the
+// runtime's blocking threads, so the window keeps being served; their result
+// comes back to the worker as a request that finishes them.
+//
 // A first contact by ticket is a pairing: both windows show the same check
 // phrase, and after comparing them each side keysigns the other. From time
 // to time, the trusted k5s that can be reached peer to peer are checked for
@@ -101,7 +106,12 @@ enum Request {
     Probed(Vec<Probe>),
     /// Something the node did.
     Net(Event),
+    /// A background operation is done: finish it on the worker.
+    Finish(Finish),
 }
+
+/// The end of a background operation, run on the worker with its result.
+type Finish = Box<dyn FnOnce(&mut Worker, &tokio::runtime::Runtime) + Send>;
 
 /// A peer checked for presence, from [`Worker::probe`].
 struct Probe {
@@ -243,12 +253,13 @@ pub fn run(k5: K5, config: PathBuf, offline: bool, attesting: Attesting) -> anyh
     });
 
     let weak = ui.as_weak();
-    let events = tx.clone();
+    let requests = tx.clone();
     thread::spawn(move || {
-        let node = (!offline).then_some((config, events));
-        Worker::new(Arc::new(k5), weak, attesting).serve(rx, node)
+        let node = (!offline).then_some(config);
+        Worker::new(Arc::new(k5), weak, attesting, requests).serve(rx, node)
     });
-    tx.send(Request::Rescan)?;
+    tx.send(Request::Rescan)
+        .map_err(|_| anyhow::anyhow!("the worker stopped"))?;
 
     ui.run()?;
 
@@ -259,8 +270,10 @@ struct Worker {
     k5: Arc<K5>,
     /// Shared with the presence checks, which run on the runtime.
     node: Option<Arc<Node>>,
-    /// Where the presence checks report.
-    requests: Option<mpsc::Sender<Request>>,
+    /// Where the node and the background operations report.
+    requests: mpsc::Sender<Request>,
+    /// The k5 of the last dossier shown, refreshed when its data changes.
+    dossier: Option<String>,
     /// The peers that answered the last presence check.
     live: HashSet<String>,
     auto_sync: bool,
@@ -284,12 +297,18 @@ struct Worker {
 }
 
 impl Worker {
-    fn new(k5: Arc<K5>, ui: slint::Weak<AppWindow>, attesting: Attesting) -> Self {
+    fn new(
+        k5: Arc<K5>,
+        ui: slint::Weak<AppWindow>,
+        attesting: Attesting,
+        requests: mpsc::Sender<Request>,
+    ) -> Self {
         Self {
             attesting,
             k5,
             node: None,
-            requests: None,
+            requests,
+            dossier: None,
             live: HashSet::new(),
             auto_sync: true,
             last_sync: HashMap::new(),
@@ -306,13 +325,8 @@ impl Worker {
     }
 
     /// Serves the requests until the window is closed. With `node`, first
-    /// starts the peer-to-peer node with the iroh key of that config file,
-    /// reporting its events on that channel.
-    fn serve(
-        mut self,
-        rx: mpsc::Receiver<Request>,
-        node: Option<(PathBuf, mpsc::Sender<Request>)>,
-    ) {
+    /// starts the peer-to-peer node with the iroh key of that config file.
+    fn serve(mut self, rx: mpsc::Receiver<Request>, node: Option<PathBuf>) {
         // Multi-threaded: the node keeps serving on the runtime's threads
         // while this one waits for requests.
         let runtime = match tokio::runtime::Builder::new_multi_thread()
@@ -322,8 +336,8 @@ impl Worker {
             Ok(runtime) => runtime,
             Err(e) => return self.status(format!("ERROR: {e:#}"), false),
         };
-        if let Some((config, events)) = node {
-            self.start_node(&runtime, &config, events);
+        if let Some(config) = node {
+            self.start_node(&runtime, &config);
         }
 
         while let Ok(request) = rx.recv() {
@@ -371,6 +385,7 @@ impl Worker {
                 Request::Tick => self.probe(&runtime),
                 Request::Probed(probes) => self.probed(&runtime, probes),
                 Request::Net(event) => self.net_event(&runtime, event),
+                Request::Finish(finish) => finish(&mut self, &runtime),
             }
         }
 
@@ -381,14 +396,9 @@ impl Worker {
 
     /// Starts the peer-to-peer node on n0's network, with the iroh key of the
     /// config file `config` (created if missing).
-    fn start_node(
-        &mut self,
-        runtime: &tokio::runtime::Runtime,
-        config: &std::path::Path,
-        events: mpsc::Sender<Request>,
-    ) {
+    fn start_node(&mut self, runtime: &tokio::runtime::Runtime, config: &std::path::Path) {
         self.status("GOING ONLINE ...".to_string(), true);
-        self.requests = Some(events.clone());
+        let events = self.requests.clone();
         let secret = match k5net::load_or_create_secret(config) {
             Ok(secret) => secret,
             Err(e) => return self.status(format!("OFFLINE: {e:#}"), false),
@@ -412,6 +422,25 @@ impl Worker {
             }
             Err(e) => self.status(format!("OFFLINE: {e:#}"), false),
         }
+    }
+
+    /// Runs `work` in the background, on the runtime's blocking threads (it
+    /// may block on the runtime with the handle it is given), so the worker
+    /// keeps serving the window; then `finish` runs on the worker with its
+    /// result.
+    fn background<T: Send + 'static>(
+        &self,
+        runtime: &tokio::runtime::Runtime,
+        work: impl FnOnce(&tokio::runtime::Handle) -> T + Send + 'static,
+        finish: impl FnOnce(&mut Worker, &tokio::runtime::Runtime, T) + Send + 'static,
+    ) {
+        let requests = self.requests.clone();
+        let handle = runtime.handle().clone();
+        runtime.spawn_blocking(move || {
+            let result = work(&handle);
+            let finish: Finish = Box::new(move |worker, runtime| finish(worker, runtime, result));
+            let _ = requests.send(Request::Finish(finish));
+        });
     }
 
     fn status(&self, status: String, busy: bool) {
@@ -469,9 +498,19 @@ impl Worker {
         });
     }
 
+    /// Shows the dossier of `k5`.
+    fn select(&mut self, k5: &str) {
+        self.dossier = Some(k5.to_string());
+        self.post_dossier(k5);
+        let _ = self.ui.upgrade_in_event_loop(|ui| {
+            ui.set_has_dossier(true);
+            ui.set_show_me(false);
+        });
+    }
+
     /// Posts the dossier of `k5`: its profile counts, whether it has an
     /// encryption subkey, and its trust path.
-    fn select(&self, k5: &str) {
+    fn post_dossier(&self, k5: &str) {
         let attestations: Vec<&ProfileAttestation> = self
             .attestations
             .iter()
@@ -546,8 +585,6 @@ impl Worker {
             ui.set_dossier(dossier);
             ui.set_glyph(ModelRc::new(VecModel::from(glyph)));
             ui.set_path(ModelRc::new(VecModel::from(path)));
-            ui.set_has_dossier(true);
-            ui.set_show_me(false);
         });
     }
 
@@ -580,109 +617,148 @@ impl Worker {
         self.post_chats();
     }
 
-    /// Sends `msg` to `to`: delivered peer to peer if `to` can be reached,
-    /// else signcrypted and copied to the clipboard, to be handed over.
-    /// Either way it is kept with the messages sent.
+    /// Sends `msg` to `to`: delivered peer to peer (in the background) if
+    /// `to` can be reached, else signcrypted and copied to the clipboard, to
+    /// be handed over. Either way it is kept with the messages sent. The draft
+    /// is kept if delivery fails.
     fn chat_send(&mut self, runtime: &tokio::runtime::Runtime, to: &str, msg: &str) {
-        let status = if let Some(node) = self.node.as_ref().filter(|_| self.online(to)) {
+        if let Some(node) = self.node.clone().filter(|_| self.online(to)) {
             self.status("DELIVERING MESSAGE ...".to_string(), true);
-            match runtime.block_on(node.send(to, msg)) {
-                Ok(()) => String::new(),
-                Err(e) => return self.status(format!("DELIVERY FAILED: {e:#}"), false),
-            }
-        } else {
-            self.status("SEALING MESSAGE ...".to_string(), true);
-            let sealed = runtime.block_on(async {
-                let sealed = self.k5.signcrypt(to, msg).await?;
-                self.k5.record_sent(to, msg).await?;
-                Ok::<_, k5lib::Error>(sealed.armored)
-            });
-            let armored = match sealed {
-                Ok(armored) => armored,
-                Err(e) => return self.status(format!("SEND FAILED: {e:#}"), false),
-            };
-            match self.copy(armored) {
-                Ok(()) => "NOT REACHABLE PEER TO PEER: MESSAGE COPIED TO CLIPBOARD".to_string(),
-                Err(e) => format!("COPY TO CLIPBOARD FAILED: {e:#}"),
-            }
-        };
+            let (to, msg) = (to.to_string(), msg.to_string());
+            return self.background(
+                runtime,
+                move |runtime| runtime.block_on(node.send(&to, &msg)),
+                |worker, runtime, delivered| match delivered {
+                    Ok(()) => {
+                        let _ = worker
+                            .ui
+                            .upgrade_in_event_loop(|ui| ui.set_draft("".into()));
+                        worker.load_chats(runtime);
+                        worker.status(String::new(), false);
+                    }
+                    Err(e) => worker.status(format!("DELIVERY FAILED: {e:#}"), false),
+                },
+            );
+        }
 
+        self.status("SEALING MESSAGE ...".to_string(), true);
+        let sealed = runtime.block_on(async {
+            let sealed = self.k5.signcrypt(to, msg).await?;
+            self.k5.record_sent(to, msg).await?;
+            Ok::<_, k5lib::Error>(sealed.armored)
+        });
+        let armored = match sealed {
+            Ok(armored) => armored,
+            Err(e) => return self.status(format!("SEND FAILED: {e:#}"), false),
+        };
+        let status = match self.copy(armored) {
+            Ok(()) => "NOT REACHABLE PEER TO PEER: MESSAGE COPIED TO CLIPBOARD".to_string(),
+            Err(e) => format!("COPY TO CLIPBOARD FAILED: {e:#}"),
+        };
         let _ = self.ui.upgrade_in_event_loop(|ui| ui.set_draft("".into()));
         self.load_chats(runtime);
         self.status(status, false);
     }
 
-    /// Merges the attestations of the peer `k5` that are on the web of trust.
+    /// Merges, in the background, the attestations of the peer `k5` that are
+    /// on the web of trust.
     fn sync(&mut self, runtime: &tokio::runtime::Runtime, k5: &str) {
-        let Some(node) = &self.node else {
+        let Some(node) = self.node.clone() else {
             return self.status("OFFLINE".to_string(), false);
         };
         let who = who(&self.k5.k5(), &self.attestations, k5);
         self.status(format!("SYNCING WITH {who} ..."), true);
 
-        let report = match runtime.block_on(node.sync(k5)) {
-            Ok(report) => report,
-            Err(e) => return self.status(format!("SYNC FAILED: {e:#}"), false),
-        };
-        let count = |f: fn(&Outcome) -> bool| {
-            report
-                .merged
-                .iter()
-                .filter(|merged| f(&merged.outcome))
-                .count()
-        };
-        let merged = new_records(&report);
-        let untrusted = count(|outcome| matches!(outcome, Outcome::Untrusted(_)));
-        let invalid = count(|outcome| matches!(outcome, Outcome::Invalid(_)));
+        let k5 = k5.to_string();
+        let peer = k5.clone();
+        self.background(
+            runtime,
+            move |runtime| runtime.block_on(node.sync(&peer)),
+            move |worker, runtime, report| {
+                let report = match report {
+                    Ok(report) => report,
+                    Err(e) => return worker.status(format!("SYNC FAILED: {e:#}"), false),
+                };
+                let count = |f: fn(&Outcome) -> bool| {
+                    report
+                        .merged
+                        .iter()
+                        .filter(|merged| f(&merged.outcome))
+                        .count()
+                };
+                let merged = new_records(&report);
+                let untrusted = count(|outcome| matches!(outcome, Outcome::Untrusted(_)));
+                let invalid = count(|outcome| matches!(outcome, Outcome::Invalid(_)));
 
-        self.rescan(runtime);
-        self.select(k5);
-        self.status(
-            format!("SYNCED WITH {who}: {merged} NEW, {untrusted} UNTRUSTED, {invalid} INVALID"),
-            false,
+                worker.rescan(runtime);
+                worker.refresh_dossier(&k5);
+                worker.status(
+                    format!(
+                        "SYNCED WITH {who}: {merged} NEW, {untrusted} UNTRUSTED, {invalid} INVALID"
+                    ),
+                    false,
+                );
+            },
         );
     }
 
-    /// Copies the ticket of the node, for a first contact, to the clipboard.
+    /// Posts the dossier of `k5` again if it is the one last shown, as its
+    /// data changed.
+    fn refresh_dossier(&self, k5: &str) {
+        if self.dossier.as_deref() == Some(k5) {
+            self.post_dossier(k5);
+        }
+    }
+
+    /// Makes a ticket of the node, for a first contact, in the background
+    /// (it waits for the home relay), and copies it to the clipboard.
     fn copy_ticket(&mut self, runtime: &tokio::runtime::Runtime) {
-        let Some(node) = &self.node else {
+        let Some(node) = self.node.clone() else {
             return self.status("OFFLINE".to_string(), false);
         };
         self.status("MAKING TICKET ...".to_string(), true);
-        let status = match runtime
-            .block_on(node.ticket())
-            .map_err(|e| format!("{e:#}"))
-        {
-            Ok(ticket) => match self.copy(ticket) {
-                Ok(()) => format!(
-                    "TICKET COPIED TO CLIPBOARD: PAIRING OPEN FOR {} MINUTES",
-                    PAIRING_WINDOW.as_secs() / 60
-                ),
-                Err(e) => format!("COPY TO CLIPBOARD FAILED: {e:#}"),
+        self.background(
+            runtime,
+            move |runtime| runtime.block_on(node.ticket()),
+            |worker, _, ticket| {
+                let status = match ticket {
+                    Ok(ticket) => match worker.copy(ticket) {
+                        Ok(()) => format!(
+                            "TICKET COPIED TO CLIPBOARD: PAIRING OPEN FOR {} MINUTES",
+                            PAIRING_WINDOW.as_secs() / 60
+                        ),
+                        Err(e) => format!("COPY TO CLIPBOARD FAILED: {e:#}"),
+                    },
+                    Err(e) => format!("NO TICKET: {e:#}"),
+                };
+                worker.status(status, false);
             },
-            Err(e) => format!("NO TICKET: {e:#}"),
-        };
-        self.status(status, false);
+        );
     }
 
-    /// Pairs with the k5 of a ticket, so each side learns how to reach the
-    /// other, and shows the check phrase.
+    /// Pairs, in the background, with the k5 of a ticket, so each side
+    /// learns how to reach the other, and shows the check phrase.
     fn connect_ticket(&mut self, runtime: &tokio::runtime::Runtime, ticket: &str) {
         let Some(node) = self.node.clone() else {
             return self.status("OFFLINE".to_string(), false);
         };
         self.status("CONNECTING ...".to_string(), true);
 
-        match runtime.block_on(node.connect_ticket(ticket)) {
-            Ok(contact) => {
-                self.live.insert(contact.k5.clone());
-                self.rescan(runtime);
-                let who = who(&self.k5.k5(), &self.attestations, &contact.k5);
-                self.show_pairing(&contact.k5, contact.trusted, &contact.phrase);
-                self.status(format!("PAIRED WITH {who}"), false);
-            }
-            Err(e) => self.status(format!("CONNECT FAILED: {e:#}"), false),
-        }
+        let ticket = ticket.to_string();
+        self.background(
+            runtime,
+            move |runtime| runtime.block_on(node.connect_ticket(&ticket)),
+            |worker, runtime, contact| match contact {
+                Ok(contact) => {
+                    worker.live.insert(contact.k5.clone());
+                    worker.rescan(runtime);
+                    let who = who(&worker.k5.k5(), &worker.attestations, &contact.k5);
+                    worker.show_pairing(&contact.k5, contact.trusted, &contact.phrase);
+                    worker.status(format!("PAIRED WITH {who}"), false);
+                }
+                Err(e) => worker.status(format!("CONNECT FAILED: {e:#}"), false),
+            },
+        );
     }
 
     /// Shows the pairing dialog: the k5 met by ticket and the check phrase.
@@ -715,25 +791,32 @@ impl Worker {
         }
     }
 
-    /// Verifies a signed message, a message for the local k5 or an
-    /// attestation record, and shows the verdict.
+    /// Verifies, in the background, a signed message, a message for the
+    /// local k5 or an attestation record, and shows the verdict.
     fn verify(&mut self, runtime: &tokio::runtime::Runtime, content: &str) {
         self.status("VERIFYING ...".to_string(), true);
-        let verdict = match runtime.block_on(self.k5.verify(content.trim())) {
-            Ok(verification) => self.verdict(verification),
-            Err(e) => Verdict {
-                ok: false,
-                title: "NOT VERIFIED".into(),
-                who: "".into(),
-                trust: "".into(),
-                body: format!("{e:#}").into(),
+        let (k5, content) = (self.k5.clone(), content.trim().to_string());
+        self.background(
+            runtime,
+            move |runtime| runtime.block_on(k5.verify(&content)),
+            |worker, _, verification| {
+                let verdict = match verification {
+                    Ok(verification) => worker.verdict(verification),
+                    Err(e) => Verdict {
+                        ok: false,
+                        title: "NOT VERIFIED".into(),
+                        who: "".into(),
+                        trust: "".into(),
+                        body: format!("{e:#}").into(),
+                    },
+                };
+                let _ = worker.ui.upgrade_in_event_loop(move |ui| {
+                    ui.set_verdict(verdict);
+                    ui.set_has_verdict(true);
+                });
+                worker.status(String::new(), false);
             },
-        };
-        let _ = self.ui.upgrade_in_event_loop(move |ui| {
-            ui.set_verdict(verdict);
-            ui.set_has_verdict(true);
-        });
-        self.status(String::new(), false);
+        );
     }
 
     /// What a verification says, for the VERIFY screen.
@@ -839,9 +922,10 @@ impl Worker {
     /// syncing with those due (see [`SYNC_INTERVAL`]) instead of just saying
     /// hello, on the runtime. The results come back as [`Request::Probed`].
     fn probe(&mut self, runtime: &tokio::runtime::Runtime) {
-        let (Some(node), Some(requests)) = (self.node.clone(), self.requests.clone()) else {
+        let Some(node) = self.node.clone() else {
             return;
         };
+        let requests = self.requests.clone();
         if self.probing {
             return;
         }
@@ -940,9 +1024,8 @@ impl Worker {
             .upgrade_in_event_loop(move |ui| ui.set_chat_online(live));
     }
 
-    /// Attests a profile of the local k5 with the notary: notarizes the page
-    /// that shows the k5 and stores the attestation. On success, shows the
-    /// dossier of the local k5.
+    /// Attests a profile of the local k5 with the notary: notarizes, in the
+    /// background, the page that shows the k5 and stores the attestation.
     fn attest(&mut self, runtime: &tokio::runtime::Runtime, kind: &str, input: &str) {
         let Some(notary) = self.attesting.notary.clone() else {
             return self.status(
@@ -966,16 +1049,31 @@ impl Worker {
         }
 
         self.status(format!("NOTARIZING {url} ..."), true);
-        let ui = self.ui.clone();
-        let notarized = runtime.block_on(self.k5.notarize(
-            &notary,
-            &url,
-            &presentation.to_string_lossy(),
-            &mut |step| {
-                let step = step.to_uppercase();
-                let _ = ui.upgrade_in_event_loop(move |ui| ui.set_status(step.into()));
+        let (k5, ui) = (self.k5.clone(), self.ui.clone());
+        self.background(
+            runtime,
+            move |runtime| {
+                runtime.block_on(k5.notarize(
+                    &notary,
+                    &url,
+                    &presentation.to_string_lossy(),
+                    &mut |step| {
+                        let step = step.to_uppercase();
+                        let _ = ui.upgrade_in_event_loop(move |ui| ui.set_status(step.into()));
+                    },
+                ))
             },
-        ));
+            |worker, runtime, notarized| worker.attested(runtime, notarized),
+        );
+    }
+
+    /// Stores the result of a notarization: on success, shows the
+    /// attestations of the local k5.
+    fn attested(
+        &mut self,
+        runtime: &tokio::runtime::Runtime,
+        notarized: Result<k5lib::api::Notarized, k5lib::Error>,
+    ) {
         let stored = match notarized.map(|notarized| notarized.record) {
             Ok(Ok(stored)) => stored,
             Ok(Err(reason)) => return self.status(format!("NOT ATTESTED: {reason}"), false),
@@ -1717,6 +1815,47 @@ mod tests {
             .find(|&y| dark(y))
             .expect("no menu button");
         top as f32 + 20.0
+    }
+
+    #[test]
+    fn test_background() {
+        let dir = std::env::temp_dir().join(format!("k5gui-bg-test-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let k5 = K5::init(&dir.join("k5.toml")).unwrap();
+        let (tx, rx) = mpsc::channel();
+        // No window: what is posted to it is dropped.
+        let attesting = Attesting {
+            notary: None,
+            presentations: dir.join("presentations"),
+        };
+        let mut worker = Worker::new(Arc::new(k5), slint::Weak::default(), attesting, tx);
+        let runtime = tokio::runtime::Builder::new_multi_thread()
+            .enable_all()
+            .build()
+            .unwrap();
+
+        // The work runs elsewhere: the worker is free right away.
+        let started = Instant::now();
+        worker.background(
+            &runtime,
+            |runtime| {
+                runtime.block_on(tokio::time::sleep(Duration::from_millis(300)));
+                "done"
+            },
+            |worker, _, result| worker.query = result.to_string(),
+        );
+        assert!(started.elapsed() < Duration::from_millis(100));
+        assert_eq!(worker.query, "");
+
+        // Its result comes back as a request, finished on the worker.
+        match rx.recv_timeout(Duration::from_secs(5)).unwrap() {
+            Request::Finish(finish) => finish(&mut worker, &runtime),
+            _ => panic!("expected a finish request"),
+        }
+        assert_eq!(worker.query, "done");
+
+        std::fs::remove_dir_all(&dir).unwrap();
     }
 
     #[test]

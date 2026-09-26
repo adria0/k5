@@ -23,7 +23,9 @@ use std::collections::{HashMap, HashSet};
 
 use anyhow::{anyhow, Context as _};
 
-use super::{check, iroh, keyring, keysignparty, Error, Invalid, ProfileAttestation};
+use super::{
+    check, iroh, keyring, keysignparty, me, record_type, Error, Invalid, ProfileAttestation,
+};
 use crate::{
     db::Db,
     key::Keys,
@@ -270,15 +272,29 @@ async fn store(
 }
 
 /// Verifies each attestation of an export.
+/// Verifies each attestation of an export, in any order: the valid self
+/// attestations in it (signed by their own key) first add their public keys
+/// to `keyring`, so what their k5s signed in the same export verifies too.
 fn verify_all(
     msg: &str,
     notary_key: &str,
     keyring: &Keyring,
 ) -> Result<Vec<VerifiedExport>, Error> {
-    Ok(parse(msg)?
+    let exported = parse(msg)?;
+
+    let mut keyring = keyring.clone();
+    for exported in &exported {
+        if record_type(&exported.record) == Some(me::RECORD_TYPE) {
+            if let Ok(me) = me::verify(&exported.record) {
+                keyring.entry(me.k5).or_insert(me.public);
+            }
+        }
+    }
+
+    Ok(exported
         .into_iter()
         .map(|exported| {
-            let result = verify_one(&exported, notary_key, keyring).map_err(|e| e.to_string());
+            let result = verify_one(&exported, notary_key, &keyring).map_err(|e| e.to_string());
             (exported, result)
         })
         .collect())
@@ -434,6 +450,40 @@ mod tests {
 
         // A wrong count is detected.
         assert!(parse(&msg.replace("count:2", "count:3")).is_err());
+    }
+
+    #[test]
+    fn test_keys_in_the_export() {
+        // Bob keysigns carol; alice's keyring does not know bob, but bob's
+        // self attestation comes in the same export, after his keysign.
+        let [bob, carol] = [test_keys(), test_keys()];
+        let (keysign_file, keysign) =
+            keysignparty::create(&bob, &carol.k5(), "Carol", false).unwrap();
+        let exported = vec![
+            Exported {
+                file: keysign_file,
+                record: keysign,
+            },
+            Exported {
+                file: me::name(&bob.k5()),
+                record: me::create(&bob, false).unwrap(),
+            },
+        ];
+        let msg = bundle("now", &exported);
+
+        let checked = verify_all(&msg, "", &Keyring::new()).unwrap();
+        for (exported, result) in &checked {
+            assert!(
+                result.is_ok(),
+                "{}: {:?}",
+                exported.file,
+                result.as_ref().err()
+            );
+        }
+
+        // Without bob's self attestation, his keysign does not verify.
+        let msg = bundle("now", &exported[..1]);
+        assert!(verify_all(&msg, "", &Keyring::new()).unwrap()[0].1.is_err());
     }
 
     #[test]
