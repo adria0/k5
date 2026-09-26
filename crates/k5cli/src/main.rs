@@ -144,6 +144,12 @@ enum AttestCommand {
     /// `db/attestations/`.
     #[command(alias = "keysignparty")]
     Keysign(KeysignArgs),
+    /// Claim your name: a statement signed by your k5, shared with your
+    /// attestations. Replaces your previous claim.
+    Name {
+        /// Your name, as others will see it.
+        name: String,
+    },
 }
 
 #[derive(Args, Debug)]
@@ -314,6 +320,11 @@ async fn main() -> anyhow::Result<()> {
                 run_merge(&args, &k5.with_notary_key(&args.notary_key)).await
             }
             AttestCommand::Keysign(args) => run_keysign(&args, &k5).await,
+            AttestCommand::Name { name } => {
+                k5.ensure_self_attestation().await?;
+                println!("{}", k5.claim_name(&name).await?);
+                Ok(())
+            }
         },
         Command::Makedot(args) => run_makedot(&args, &k5.with_notary_key(&args.notary_key)).await,
         Command::P2p(args) => p2p::run(args, k5, &cli.config).await,
@@ -729,6 +740,10 @@ fn print_attested(attested: Attested) -> anyhow::Result<()> {
         }
         Attested::Iroh(iroh) => {
             println!("{} created:{}{fake}", iroh.profile(), iroh.date);
+            return Ok(());
+        }
+        Attested::Claim(claim) => {
+            println!("{} created:{}{fake}", claim.profile(), claim.date);
             return Ok(());
         }
     };

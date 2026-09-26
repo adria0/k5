@@ -125,7 +125,10 @@ impl Db for FsDb {
 /// same directory, synced to disk, then moved over `path`. A crash leaves
 /// either the old file or the new one, never a truncated one, and readers
 /// never see a partial write. With `private`, the file is readable only by
-/// its owner. With `create_new`, fails if `path` exists.
+/// its owner. With `create_new`, fails if `path` exists: the name is claimed
+/// first (an empty file, created only if there is none), then replaced. A
+/// crash in between leaves that empty file, never a partial one. No hard link
+/// is used, as Android does not let apps create them.
 pub(crate) fn write_atomic(
     path: &Path,
     content: &[u8],
@@ -157,19 +160,22 @@ pub(crate) fn write_atomic(
     #[cfg(not(unix))]
     let _ = private;
 
+    if create_new {
+        options.open(path)?;
+    }
     let result = (|| {
         let mut file = options.open(&tmp)?;
         file.write_all(content)?;
         file.sync_all()?;
-        if create_new {
-            // Unlike a rename, a hard link fails if `path` exists.
-            std::fs::hard_link(&tmp, path)
-        } else {
-            std::fs::rename(&tmp, path)
-        }
+        std::fs::rename(&tmp, path)
     })();
-    // Left behind by a failure, or by the hard link.
-    let _ = std::fs::remove_file(&tmp);
+    if result.is_err() {
+        let _ = std::fs::remove_file(&tmp);
+        if create_new {
+            // The empty file this call claimed.
+            let _ = std::fs::remove_file(path);
+        }
+    }
     result?;
 
     // Make the new directory entry durable too.

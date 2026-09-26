@@ -1,0 +1,4 @@
+# Android (k5android): 16 KB memory pages, which recent Android devices use
+# and Google Play requires.
+[target.aarch64-linux-android]
+rustflags = ["-C", "link-arg=-Wl,-z,max-page-size=16384"]

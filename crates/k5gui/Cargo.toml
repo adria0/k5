@@ -8,6 +8,11 @@ version = "0.1.0"
 [lints]
 workspace = true
 
+# The window, also used by the Android app (`k5android`).
+[lib]
+name = "k5gui"
+path = "src/lib.rs"
+
 [[bin]]
 name = "k5gui"
 path = "src/main.rs"
@@ -17,13 +22,29 @@ anyhow = { workspace = true }
 k5lib = { path = "../k5lib" }
 k5net = { path = "../k5net" }
 
-arboard = { version = "3.6" }
 chrono = { workspace = true }
+log = { workspace = true }
+# Tickets as QR codes: shown (qrcode), and read from the camera (rqrr).
+qrcode = { version = "0.14", default-features = false }
+rqrr = { version = "0.11" }
 clap = { version = "4.5", features = ["derive"] }
 slint = { version = "1.18" }
 tokio = { workspace = true, features = ["rt", "rt-multi-thread"] }
+toml = { workspace = true }
+
+# The clipboard: arboard on the desktop, Android's ClipboardManager through
+# JNI on Android (arboard has no Android backend).
+[target.'cfg(not(target_os = "android"))'.dependencies]
+arboard = { version = "3.6" }
+
+[target.'cfg(target_os = "android")'.dependencies]
+jni = { version = "0.22" }
+ndk-context = { version = "0.1" }
 
 [dev-dependencies]
+# The Android clipboard code is also compiled in tests, to check it here.
+jni = { version = "0.22" }
+ndk-context = { version = "0.1" }
 # Offscreen rendering, for the window snapshot test in `gui`.
 slint = { version = "1.18", features = ["renderer-software"] }
 

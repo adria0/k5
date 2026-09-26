@@ -18,7 +18,7 @@ use std::{
 use anyhow::{anyhow, Context as _};
 
 use crate::{
-    attestations::{self, export, iroh, keysignparty, me, tlsnotary},
+    attestations::{self, claim, export, iroh, keysignparty, me, tlsnotary},
     db::{Db, FsDb},
     graph,
     k5id::K5Id,
@@ -27,6 +27,7 @@ use crate::{
 };
 pub use crate::{
     attestations::{
+        claim::Claim,
         export::{Export, Merged, Outcome},
         iroh::Iroh,
         keysignparty::KeySign,
@@ -324,6 +325,17 @@ impl K5 {
             export::merge(self.db(), markdown, &self.k5(), &self.notary_key, force).await?;
 
         Ok(MergeReport { signer, merged })
+    }
+
+    /// Claims `name` as the name of the local k5, replacing its previous
+    /// claim. Returns where it was stored.
+    pub async fn claim_name(&self, name: &str) -> Result<String, Error> {
+        claim::set(self.db(), &self.keys, name.trim()).await
+    }
+
+    /// The name `k5` claims for itself, if its claim is in the database.
+    pub async fn name_claim(&self, k5: &str) -> Result<Option<Claim>, Error> {
+        claim::lookup(self.db(), &K5Id::parse(k5)?).await
     }
 
     /// Attests that `k5` belongs to `name`, storing the attestation.

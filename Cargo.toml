@@ -10,6 +10,7 @@ members = [
     "crates/k5lib",
     "crates/k5cli",
     "crates/k5gui",
+    "crates/k5android",
     "crates/k5net",
     "crates/examples",
     "crates/formats",

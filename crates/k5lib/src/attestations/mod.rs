@@ -17,6 +17,7 @@
 // statements the fake flag is part of the signature, and the `- Fake:` of the
 // info must match it, so a fake attestation can never pass as a real one.
 
+pub mod claim;
 pub mod export;
 pub mod fake;
 pub mod iroh;
@@ -59,6 +60,8 @@ pub enum Attested {
     Fake(fake::Fake),
     /// The iroh endpoint a k5 can be reached at, signed by the k5.
     Iroh(iroh::Iroh),
+    /// The name a k5 claims for itself.
+    Claim(claim::Claim),
 }
 
 /// An attestation of a profile, displayed as `<platform>:<user>`, followed by
@@ -98,6 +101,7 @@ impl Attested {
             Attested::Me(me) => me.fake,
             Attested::Fake(_) => true,
             Attested::Iroh(_) => false,
+            Attested::Claim(_) => false,
         }
     }
 
@@ -169,11 +173,54 @@ impl Attested {
                 file,
                 fake,
             },
+            Attested::Claim(claim) => ProfileAttestation {
+                profile: claim.profile(),
+                attributes: vec![
+                    ("type", claim::RECORD_TYPE.to_string()),
+                    ("date", claim.date.clone()),
+                ],
+                signer: Some(claim.k5),
+                file,
+                fake,
+            },
         };
         attestation.attributes.insert(1, ("fake", fake.to_string()));
 
         Ok(attestation)
     }
+}
+
+/// The statement of a record signed by a k5 (`# statement`, then its
+/// detached `# signature`), once its signature is verified with the
+/// signer's key from `keyring`, and the signer's k5. `kind` names the record
+/// in errors.
+pub(crate) fn signed_statement<'a>(
+    record: &'a str,
+    keyring: &Keyring,
+    kind: &str,
+) -> Result<(&'a str, String), Error> {
+    use pgp::composed::{Deserializable, DetachedSignature};
+
+    let (_, rest) = record
+        .split_once("\n# statement\n")
+        .with_context(|| format!("{kind} record has no `# statement` section"))?;
+    let (statement, signature) = rest
+        .rsplit_once("\n# signature\n")
+        .with_context(|| format!("{kind} record has no `# signature` section"))?;
+
+    let (signature, _) = DetachedSignature::from_string(signature)?;
+    let signer = signature
+        .signature
+        .issuer_fingerprint()
+        .first()
+        .context("signature has no issuer fingerprint")?
+        .to_string();
+    let signer_key = keyring
+        .get(&signer)
+        .with_context(|| format!("unknown signer k5:{signer}: fetch its self attestation first"))?;
+    signature.verify(signer_key, statement.as_bytes())?;
+
+    Ok((statement, signer))
 }
 
 /// Verifies an attestation record of any type. TLSNotary records must be
@@ -192,6 +239,7 @@ pub fn verify(record: &str, notary_key: &str, keyring: &Keyring) -> Result<Attes
         keysignparty::RECORD_TYPE => Attested::KeySign(keysignparty::verify(record, keyring)?),
         me::RECORD_TYPE => Attested::Me(Box::new(me::verify(record)?)),
         iroh::RECORD_TYPE => Attested::Iroh(iroh::verify(record, keyring)?),
+        claim::RECORD_TYPE => Attested::Claim(claim::verify(record, keyring)?),
         other => return Err(anyhow!("unsupported attestation type `{other}`")),
     };
 

@@ -17,11 +17,7 @@
 // the statement must be signed by the k5 it names.
 
 use anyhow::{anyhow, Context as _};
-use pgp::{
-    composed::{Deserializable, DetachedSignature},
-    crypto::hash::HashAlgorithm,
-    types::Password,
-};
+use pgp::{composed::DetachedSignature, crypto::hash::HashAlgorithm, types::Password};
 use rand::rngs::OsRng;
 
 use super::{me, Error, Profile};
@@ -93,25 +89,7 @@ pub fn create(keys: &Keys, endpoint: &str) -> Result<String, Error> {
 /// by the fingerprint carried in the signature. The signer must be the k5
 /// the statement names.
 pub fn verify(record: &str, keyring: &Keyring) -> Result<Iroh, Error> {
-    let (_, rest) = record
-        .split_once("\n# statement\n")
-        .context("iroh record has no `# statement` section")?;
-    let (statement, signature) = rest
-        .rsplit_once("\n# signature\n")
-        .context("iroh record has no `# signature` section")?;
-
-    let (signature, _) = DetachedSignature::from_string(signature)?;
-    let signer = signature
-        .signature
-        .issuer_fingerprint()
-        .first()
-        .context("signature has no issuer fingerprint")?
-        .to_string();
-    let signer_key = keyring
-        .get(&signer)
-        .with_context(|| format!("unknown signer k5:{signer}: fetch its self attestation first"))?;
-    signature.verify(signer_key, statement.as_bytes())?;
-
+    let (statement, signer) = super::signed_statement(record, keyring, RECORD_TYPE)?;
     let iroh = parse_statement(statement)?;
     if iroh.k5 != signer {
         return Err(anyhow!(

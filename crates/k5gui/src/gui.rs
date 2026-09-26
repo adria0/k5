@@ -24,6 +24,12 @@
 // runtime's blocking threads, so the window keeps being served; their result
 // comes back to the worker as a request that finishes them.
 //
+// A ticket can come with a plan for the first k5 that pairs with it: keysign
+// it as a given name (without comparing the check phrase) and import its
+// attestations. Pasting a ticket (CONNECT) can do the same with its k5. A peer
+// only shares them with k5s on its web of trust, so the import is retried at
+// each presence check until the peer keysigned back.
+//
 // A first contact by ticket is a pairing: both windows show the same check
 // phrase, and after comparing them each side keysigns the other. From time
 // to time, the trusted k5s that can be reached peer to peer are checked for
@@ -54,6 +60,8 @@ const KEYSIGN: &str = "keysignparty";
 /// Platform of the iroh attestations, never shown: they only tell whether a
 /// k5 can be reached peer to peer.
 const IROH: &str = "iroh";
+/// Platform of the name claims: the name a k5 gives itself.
+const NAME: &str = "name";
 /// Maximum number of search results shown.
 const MAX_HITS: usize = 300;
 /// When the first presence check runs, and how often the next ones do.
@@ -80,8 +88,15 @@ enum Request {
         to: String,
         msg: String,
     },
-    CopyTicket,
-    ConnectTicket(String),
+    /// Make a ticket and copy it, with what to do when a k5 pairs with it.
+    CopyTicket(TicketPlan),
+    /// Pair with the k5 of a ticket, then keysign it with a name and import
+    /// its attestations, if asked.
+    ConnectTicket {
+        ticket: String,
+        keysign: Option<String>,
+        import: bool,
+    },
     /// Attest a profile of the local k5: its kind (`x`, `github`, `site`,
     /// `email`) and what identifies it (a URL, a domain).
     Attest {
@@ -108,6 +123,26 @@ enum Request {
     Net(Event),
     /// A background operation is done: finish it on the worker.
     Finish(Finish),
+    /// Claim a name for the local k5.
+    ClaimName(String),
+    /// Fill the connect dialog with the ticket on the clipboard.
+    PasteTicket,
+    /// Start and stop the camera, to read a ticket from a QR code.
+    StartScan,
+    StopScan,
+    /// The camera read a ticket, or failed.
+    Scanned(Result<String, String>),
+}
+
+/// What to do with the first k5 that pairs with a ticket, while the pairing
+/// window is open.
+struct TicketPlan {
+    /// Keysign it with this name.
+    keysign: Option<String>,
+    /// Import its attestations.
+    import: bool,
+    /// When the pairing window closes.
+    until: Instant,
 }
 
 /// The end of a background operation, run on the worker with its result.
@@ -132,10 +167,17 @@ pub struct Attesting {
 
 /// Opens the window, blocking until it is closed. Unless `offline`, starts
 /// the peer-to-peer node, with the iroh key of the config file `config`.
-pub fn run(k5: K5, config: PathBuf, offline: bool, attesting: Attesting) -> anyhow::Result<()> {
+pub fn run(
+    k5: K5,
+    config: PathBuf,
+    offline: bool,
+    attesting: Attesting,
+    scanner: Option<Box<dyn crate::scanner::Scanner>>,
+) -> anyhow::Result<()> {
     let ui = AppWindow::new()?;
     ui.set_me(short(&k5.k5()).into());
     ui.set_me_k5(k5.k5().into());
+    ui.set_can_scan(scanner.is_some());
     ui.set_me_glyph(ModelRc::new(VecModel::from(glyph(&k5.k5()))));
     if let Some(notary) = &attesting.notary {
         ui.set_notary(format!("{}:{}", notary.host, notary.port).into());
@@ -189,14 +231,24 @@ pub fn run(k5: K5, config: PathBuf, offline: bool, attesting: Attesting) -> anyh
     });
     ui.on_copy_ticket({
         let tx = tx.clone();
-        move || {
-            let _ = tx.send(Request::CopyTicket);
+        move |name, import| {
+            let name = name.trim().to_string();
+            let _ = tx.send(Request::CopyTicket(TicketPlan {
+                keysign: (!name.is_empty()).then_some(name),
+                import,
+                until: Instant::now() + PAIRING_WINDOW,
+            }));
         }
     });
     ui.on_connect_ticket({
         let tx = tx.clone();
-        move |ticket| {
-            let _ = tx.send(Request::ConnectTicket(ticket.into()));
+        move |ticket, name, import| {
+            let name = name.trim().to_string();
+            let _ = tx.send(Request::ConnectTicket {
+                ticket: ticket.into(),
+                keysign: (!name.is_empty()).then_some(name),
+                import,
+            });
         }
     });
     ui.on_attest({
@@ -212,6 +264,30 @@ pub fn run(k5: K5, config: PathBuf, offline: bool, attesting: Attesting) -> anyh
         let tx = tx.clone();
         move || {
             let _ = tx.send(Request::CopyK5);
+        }
+    });
+    ui.on_claim_name({
+        let tx = tx.clone();
+        move |name| {
+            let _ = tx.send(Request::ClaimName(name.into()));
+        }
+    });
+    ui.on_paste_ticket({
+        let tx = tx.clone();
+        move || {
+            let _ = tx.send(Request::PasteTicket);
+        }
+    });
+    ui.on_start_scan({
+        let tx = tx.clone();
+        move || {
+            let _ = tx.send(Request::StartScan);
+        }
+    });
+    ui.on_stop_scan({
+        let tx = tx.clone();
+        move || {
+            let _ = tx.send(Request::StopScan);
         }
     });
     ui.on_open_me({
@@ -256,7 +332,9 @@ pub fn run(k5: K5, config: PathBuf, offline: bool, attesting: Attesting) -> anyh
     let requests = tx.clone();
     thread::spawn(move || {
         let node = (!offline).then_some(config);
-        Worker::new(Arc::new(k5), weak, attesting, requests).serve(rx, node)
+        let mut worker = Worker::new(Arc::new(k5), weak, attesting, requests);
+        worker.scanner = scanner;
+        worker.serve(rx, node)
     });
     tx.send(Request::Rescan)
         .map_err(|_| anyhow::anyhow!("the worker stopped"))?;
@@ -281,12 +359,21 @@ struct Worker {
     last_sync: HashMap<String, Instant>,
     /// A presence check is running.
     probing: bool,
+    /// The plan of the last ticket made, until a k5 pairs with it.
+    ticket_plan: Option<TicketPlan>,
+    /// The camera, to read tickets from QR codes.
+    scanner: Option<Box<dyn crate::scanner::Scanner>>,
+    /// The name was asked for, if the local k5 claims none (once a run).
+    name_asked: bool,
+    /// Peers whose attestations are to be imported (a ticket's plan),
+    /// retried at each presence check until it succeeds.
+    pending_import: HashSet<String>,
     ui: slint::Weak<AppWindow>,
     /// The verified attestations, as of the last scan.
     attestations: Vec<ProfileAttestation>,
     trusted: HashSet<String>,
     query: String,
-    clipboard: Option<arboard::Clipboard>,
+    clipboard: crate::clipboard::Clipboard,
     /// The conversations, as of the last load.
     conversations: Vec<Conversation>,
     /// The k5 whose conversation is shown.
@@ -313,11 +400,15 @@ impl Worker {
             auto_sync: true,
             last_sync: HashMap::new(),
             probing: false,
+            ticket_plan: None,
+            scanner: None,
+            name_asked: false,
+            pending_import: HashSet::new(),
             ui,
             attestations: Vec::new(),
             trusted: HashSet::new(),
             query: String::new(),
-            clipboard: None,
+            clipboard: Default::default(),
             conversations: Vec::new(),
             open_chat: None,
             unread: HashMap::new(),
@@ -345,6 +436,7 @@ impl Worker {
                 Request::Rescan => {
                     self.rescan(&runtime);
                     self.load_chats(&runtime);
+                    self.ask_name_once();
                 }
                 Request::Search(query) => {
                     self.query = query;
@@ -358,8 +450,16 @@ impl Worker {
                     self.post_chats();
                 }
                 Request::ChatSend { to, msg } => self.chat_send(&runtime, &to, &msg),
-                Request::CopyTicket => self.copy_ticket(&runtime),
-                Request::ConnectTicket(ticket) => self.connect_ticket(&runtime, &ticket),
+                Request::CopyTicket(plan) => {
+                    // Only a plan that does something is kept.
+                    self.ticket_plan = (plan.keysign.is_some() || plan.import).then_some(plan);
+                    self.copy_ticket(&runtime);
+                }
+                Request::ConnectTicket {
+                    ticket,
+                    keysign,
+                    import,
+                } => self.connect_ticket(&runtime, &ticket, keysign, import),
                 Request::Attest { kind, input } => self.attest(&runtime, &kind, &input),
                 Request::ShowMe => self.show_me(),
                 Request::CopyK5 => {
@@ -386,6 +486,15 @@ impl Worker {
                 Request::Probed(probes) => self.probed(&runtime, probes),
                 Request::Net(event) => self.net_event(&runtime, event),
                 Request::Finish(finish) => finish(&mut self, &runtime),
+                Request::PasteTicket => self.paste_ticket(),
+                Request::ClaimName(name) => self.claim_name(&runtime, &name),
+                Request::StartScan => self.start_scan(),
+                Request::StopScan => {
+                    if let Some(scanner) = &mut self.scanner {
+                        scanner.stop();
+                    }
+                }
+                Request::Scanned(scanned) => self.scanned(scanned),
             }
         }
 
@@ -476,6 +585,12 @@ impl Worker {
         };
         self.status(status, false);
         self.search();
+        let my_name = claimed_name(&self.attestations, &self.k5.k5())
+            .unwrap_or_default()
+            .to_string();
+        let _ = self
+            .ui
+            .upgrade_in_event_loop(move |ui| ui.set_my_name(my_name.into()));
         let owned = owned(&self.k5.k5(), &self.attestations);
         let _ = self.ui.upgrade_in_event_loop(move |ui| {
             ui.set_owned(ModelRc::new(VecModel::from(owned)));
@@ -535,7 +650,7 @@ impl Worker {
             .filter(|attestation| attestation.profile.platform == "self_attestation")
             .filter_map(|attestation| attribute(attestation, "encryption_subkey"))
             .any(|subkey| !subkey.is_empty());
-        let name = ["X", "github", "site", "keysignparty"]
+        let name = [NAME, "X", "github", "site", "keysignparty"]
             .iter()
             .find_map(|platform| {
                 attestations
@@ -721,6 +836,9 @@ impl Worker {
             runtime,
             move |runtime| runtime.block_on(node.ticket()),
             |worker, _, ticket| {
+                if let Ok(ticket) = &ticket {
+                    worker.show_qr(ticket);
+                }
                 let status = match ticket {
                     Ok(ticket) => match worker.copy(ticket) {
                         Ok(()) => format!(
@@ -736,9 +854,111 @@ impl Worker {
         );
     }
 
+    /// Asks for the local k5's name, once a run, if it claims none.
+    fn ask_name_once(&mut self) {
+        if self.name_asked || claimed_name(&self.attestations, &self.k5.k5()).is_some() {
+            return;
+        }
+        self.name_asked = true;
+        let _ = self.ui.upgrade_in_event_loop(|ui| ui.set_asking_name(true));
+    }
+
+    /// Claims `name` for the local k5 (replacing its previous claim).
+    fn claim_name(&mut self, runtime: &tokio::runtime::Runtime, name: &str) {
+        match runtime.block_on(self.k5.claim_name(name)) {
+            Ok(_) => {
+                self.rescan(runtime);
+                self.status(format!("YOU ARE {}", name.trim()), false);
+            }
+            Err(e) => self.status(format!("NAME NOT SAVED: {e:#}"), false),
+        }
+    }
+
+    /// Fills the connect dialog with the first ticket in the clipboard's
+    /// text (e.g. a whole message that contains one).
+    fn paste_ticket(&mut self) {
+        let text = match self.clipboard.get_text() {
+            Ok(text) => text.unwrap_or_default(),
+            Err(e) => return self.status(format!("PASTE FAILED: {e:#}"), false),
+        };
+        let Some(ticket) = crate::clipboard::find_ticket(&text).map(str::to_string) else {
+            return self.status("NO TICKET ON THE CLIPBOARD".to_string(), false);
+        };
+        let _ = self
+            .ui
+            .upgrade_in_event_loop(move |ui| ui.set_connect_text(ticket.into()));
+        self.status("TICKET PASTED".to_string(), false);
+    }
+
+    /// Starts the camera: its frames are shown and searched for a ticket's
+    /// QR code, reported as [`Request::Scanned`].
+    fn start_scan(&mut self) {
+        let Some(scanner) = &mut self.scanner else {
+            return;
+        };
+        let (ui, requests) = (self.ui.clone(), self.requests.clone());
+        let mut found = false;
+        scanner.start(Box::new(move |scan| match scan {
+            crate::scanner::Scan::Frame(frame) => {
+                let preview = crate::scanner::preview(&frame, 480);
+                let _ = ui.upgrade_in_event_loop(move |ui| {
+                    ui.set_scan_preview(slint::Image::from_rgb8(preview));
+                });
+                if !found {
+                    if let Some(ticket) = crate::scanner::ticket(&frame) {
+                        found = true;
+                        let _ = requests.send(Request::Scanned(Ok(ticket)));
+                    }
+                }
+            }
+            crate::scanner::Scan::Failed(e) => {
+                let _ = requests.send(Request::Scanned(Err(e)));
+            }
+        }));
+        self.status("SCANNING ...".to_string(), false);
+    }
+
+    /// Stops the camera and fills the connect dialog with the ticket read.
+    fn scanned(&mut self, scanned: Result<String, String>) {
+        if let Some(scanner) = &mut self.scanner {
+            scanner.stop();
+        }
+        let status = match &scanned {
+            Ok(_) => "TICKET SCANNED".to_string(),
+            Err(e) => format!("CAMERA: {e}"),
+        };
+        let _ = self.ui.upgrade_in_event_loop(move |ui| {
+            if let Ok(ticket) = scanned {
+                ui.set_connect_text(ticket.into());
+            }
+            ui.set_scanning(false);
+        });
+        self.status(status, false);
+    }
+
+    /// Shows `ticket` as a QR code, to scan from the other device.
+    fn show_qr(&self, ticket: &str) {
+        // 6 pixels per module: sharp once scaled to the dialog.
+        match crate::qr::pixel_buffer(ticket, 6) {
+            Ok(buffer) => {
+                let _ = self.ui.upgrade_in_event_loop(move |ui| {
+                    ui.set_ticket_qr(slint::Image::from_rgb8(buffer));
+                    ui.set_showing_qr(true);
+                });
+            }
+            Err(e) => log::warn!("no QR code for the ticket: {e:#}"),
+        }
+    }
+
     /// Pairs, in the background, with the k5 of a ticket, so each side
     /// learns how to reach the other, and shows the check phrase.
-    fn connect_ticket(&mut self, runtime: &tokio::runtime::Runtime, ticket: &str) {
+    fn connect_ticket(
+        &mut self,
+        runtime: &tokio::runtime::Runtime,
+        ticket: &str,
+        keysign: Option<String>,
+        import: bool,
+    ) {
         let Some(node) = self.node.clone() else {
             return self.status("OFFLINE".to_string(), false);
         };
@@ -748,15 +968,104 @@ impl Worker {
         self.background(
             runtime,
             move |runtime| runtime.block_on(node.connect_ticket(&ticket)),
-            |worker, runtime, contact| match contact {
+            move |worker, runtime, contact| match contact {
                 Ok(contact) => {
                     worker.live.insert(contact.k5.clone());
                     worker.rescan(runtime);
+                    let done =
+                        worker.follow_plan(runtime, &contact.k5, contact.trusted, keysign, import);
+                    let trusted = contact.trusted || worker.trusted.contains(&contact.k5);
+                    worker.show_pairing(&contact.k5, trusted, &contact.phrase);
                     let who = who(&worker.k5.k5(), &worker.attestations, &contact.k5);
-                    worker.show_pairing(&contact.k5, contact.trusted, &contact.phrase);
-                    worker.status(format!("PAIRED WITH {who}"), false);
+                    let status = std::iter::once(format!("PAIRED WITH {who}"))
+                        .chain(done)
+                        .collect::<Vec<_>>()
+                        .join(": ");
+                    worker.status(status, false);
                 }
                 Err(e) => worker.status(format!("CONNECT FAILED: {e:#}"), false),
+            },
+        );
+    }
+
+    /// Follows the plan of the ticket `k5` paired with, if it is still valid
+    /// (once: for the first k5 that pairs): keysigns it and starts importing
+    /// its attestations. Returns what was done, for the status.
+    fn follow_ticket_plan(
+        &mut self,
+        runtime: &tokio::runtime::Runtime,
+        k5: &str,
+        trusted: bool,
+    ) -> Vec<String> {
+        let Some(plan) = self
+            .ticket_plan
+            .take()
+            .filter(|plan| Instant::now() < plan.until)
+        else {
+            return Vec::new();
+        };
+
+        self.follow_plan(runtime, k5, trusted, plan.keysign, plan.import)
+    }
+
+    /// Keysigns the paired `k5` as `keysign` (unless it is `trusted`
+    /// already) and, with `import`, starts importing its attestations.
+    /// Returns what was done, for the status.
+    fn follow_plan(
+        &mut self,
+        runtime: &tokio::runtime::Runtime,
+        k5: &str,
+        trusted: bool,
+        keysign: Option<String>,
+        import: bool,
+    ) -> Vec<String> {
+        let mut done = Vec::new();
+        if let Some(name) = keysign.filter(|_| !trusted) {
+            match runtime.block_on(self.k5.keysign(k5, &name)) {
+                Ok(_) => {
+                    self.rescan(runtime);
+                    done.push(format!("KEYSIGNED AS {name}"));
+                }
+                Err(e) => done.push(format!("KEYSIGN FAILED: {e:#}")),
+            }
+        }
+        if import {
+            self.pending_import.insert(k5.to_string());
+            self.import(runtime, k5);
+            done.push("IMPORTING THEIR ATTESTATIONS".to_string());
+        }
+
+        done
+    }
+
+    /// Imports, in the background, the attestations of `k5` (a sync). If it
+    /// refuses (it has not keysigned the local k5 yet), the presence checks
+    /// retry.
+    fn import(&mut self, runtime: &tokio::runtime::Runtime, k5: &str) {
+        let Some(node) = self.node.clone() else {
+            return;
+        };
+        let k5 = k5.to_string();
+        let peer = k5.clone();
+        self.background(
+            runtime,
+            move |runtime| runtime.block_on(node.sync(&peer)),
+            move |worker, runtime, report| {
+                let who = who(&worker.k5.k5(), &worker.attestations, &k5);
+                match report {
+                    Ok(report) => {
+                        worker.pending_import.remove(&k5);
+                        worker.rescan(runtime);
+                        worker.status(
+                            format!("IMPORTED {} ATTESTATIONS FROM {who}", new_records(&report)),
+                            false,
+                        );
+                    }
+                    Err(_) => worker.status(
+                        format!("THE IMPORT FROM {who} WAITS UNTIL THEY KEYSIGN YOU"),
+                        false,
+                    ),
+                }
             },
         );
     }
@@ -943,11 +1252,12 @@ impl Worker {
         let jobs: Vec<(String, bool)> = peers
             .into_iter()
             .map(|k5| {
-                let due = self.auto_sync
-                    && self
-                        .last_sync
-                        .get(&k5)
-                        .is_none_or(|last| now.duration_since(*last) >= SYNC_INTERVAL);
+                let due = self.pending_import.contains(&k5)
+                    || self.auto_sync
+                        && self
+                            .last_sync
+                            .get(&k5)
+                            .is_none_or(|last| now.duration_since(*last) >= SYNC_INTERVAL);
                 if due {
                     self.last_sync.insert(k5.clone(), now);
                 }
@@ -1000,6 +1310,9 @@ impl Worker {
                 self.live.insert(probe.k5.clone());
             } else {
                 self.live.remove(&probe.k5);
+            }
+            if probe.synced.is_some() {
+                self.pending_import.remove(&probe.k5);
             }
             if let Some(new) = probe.synced.filter(|new| *new > 0) {
                 synced.push(format!(
@@ -1127,8 +1440,14 @@ impl Worker {
                 // Its records arrived with the hello.
                 self.live.insert(k5.clone());
                 self.rescan(runtime);
+                let done = self.follow_ticket_plan(runtime, &k5, trusted);
+                let trusted = trusted || self.trusted.contains(&k5);
                 self.show_pairing(&k5, trusted, &phrase);
-                format!("PAIRED WITH {}", who(&me, &self.attestations, &k5))
+                let who = who(&me, &self.attestations, &k5);
+                std::iter::once(format!("PAIRED WITH {who}"))
+                    .chain(done)
+                    .collect::<Vec<_>>()
+                    .join(": ")
             }
             Event::Refused { endpoint, reason } => {
                 format!("REFUSED {}: {reason}", short(&endpoint))
@@ -1192,14 +1511,9 @@ impl Worker {
         });
     }
 
-    /// Puts `text` on the clipboard. The clipboard is kept open: on Linux its
-    /// content is lost when it is closed.
-    fn copy(&mut self, text: String) -> Result<(), arboard::Error> {
-        let clipboard = match &mut self.clipboard {
-            Some(clipboard) => clipboard,
-            None => self.clipboard.insert(arboard::Clipboard::new()?),
-        };
-        clipboard.set_text(text)
+    /// Puts `text` on the system clipboard.
+    fn copy(&mut self, text: String) -> anyhow::Result<()> {
+        self.clipboard.set_text(text)
     }
 }
 
@@ -1380,6 +1694,12 @@ fn owned(me: &str, attestations: &[ProfileAttestation]) -> Vec<Owned> {
                         format!("BY {by} · {}", date()),
                     )
                 }
+                NAME => (
+                    0,
+                    "self",
+                    format!("NAME : {user}"),
+                    format!("CLAIMED BY YOU · {}", date()),
+                ),
                 SELF => (
                     2,
                     "self",
@@ -1436,7 +1756,7 @@ fn profiles(attestations: &[ProfileAttestation], k5: &str) -> Option<String> {
     let profiles: BTreeSet<String> = attestations
         .iter()
         .filter(|attestation| attestation.profile.k5 == k5)
-        .filter(|attestation| !matches!(attestation.profile.platform, SELF | KEYSIGN | IROH))
+        .filter(|attestation| !matches!(attestation.profile.platform, SELF | KEYSIGN | IROH | NAME))
         .map(|attestation| {
             format!(
                 "{}:{}",
@@ -1460,9 +1780,29 @@ fn keysigned_name<'a>(attestations: &'a [ProfileAttestation], k5: &str) -> Optio
 /// Who `k5` is, on a card that also shows its short id: its profiles, or
 /// else the name it was keysigned with.
 fn card_label(attestations: &[ProfileAttestation], k5: &str) -> String {
-    profiles(attestations, k5)
+    identity(attestations, k5)
         .or_else(|| keysigned_name(attestations, k5).map(str::to_string))
         .unwrap_or_else(|| "UNKNOWN".to_string())
+}
+
+/// The name `k5` claims for itself, among `attestations`, if any.
+fn claimed_name<'a>(attestations: &'a [ProfileAttestation], k5: &str) -> Option<&'a str> {
+    attestations
+        .iter()
+        .find(|attestation| attestation.profile.k5 == k5 && attestation.profile.platform == NAME)
+        .map(|attestation| attestation.profile.user.as_str())
+}
+
+/// The name `k5` claims, then its profiles (`Alice · X:alice`), if it has
+/// either.
+fn identity(attestations: &[ProfileAttestation], k5: &str) -> Option<String> {
+    let parts: Vec<String> = claimed_name(attestations, k5)
+        .map(str::to_string)
+        .into_iter()
+        .chain(profiles(attestations, k5))
+        .collect();
+
+    (!parts.is_empty()).then(|| parts.join(" · "))
 }
 
 /// Who `k5` is, among `attestations` (`me` being the local k5): its
@@ -1472,8 +1812,11 @@ fn who(me: &str, attestations: &[ProfileAttestation], k5: &str) -> String {
     if k5 == me {
         return "YOU".to_string();
     }
-    if let Some(profiles) = profiles(attestations, k5) {
-        return profiles;
+    // A claimed name alone is only what it says of itself: with its k5.
+    match (claimed_name(attestations, k5), profiles(attestations, k5)) {
+        (_, Some(_)) => return identity(attestations, k5).unwrap_or_default(),
+        (Some(name), None) => return format!("{name} (k5:{})", short(k5)),
+        (None, None) => {}
     }
 
     match keysigned_name(attestations, k5) {
@@ -1507,7 +1850,8 @@ mod tests {
     /// `search-typed.ppm`, `menu.ppm`, `menu-attest.ppm`, `chats.ppm`,
     /// `chat.ppm`, `chat-draft.ppm`, `dossier.ppm`, `connect.ppm`,
     /// `attest-x.ppm`, `attest-site.ppm`, `attest-email.ppm`, `me.ppm`,
-    /// `verify.ppm`, `verify-invalid.ppm` and `pairing.ppm`, with the software
+    /// `verify.ppm`, `verify-invalid.ppm`, `pairing.ppm`, `ticket.ppm`,
+    /// `ticket-qr.ppm`, `scan.ppm` and `name.ppm`, with the software
     /// renderer, to look at the design without a display.
     #[test]
     #[ignore = "writes window snapshots to $K5_SNAPSHOT"]
@@ -1669,11 +2013,6 @@ mod tests {
         // The entries reach the window: the popup's rows start below its
         // border and padding, 46px apart.
         let entry = |row: f32| menu_y + 20.0 + 6.0 + 3.0 + 6.0 + row * 46.0 + 22.0;
-        let tickets = Rc::new(std::cell::Cell::new(0));
-        ui.on_copy_ticket({
-            let tickets = tickets.clone();
-            move || tickets.set(tickets.get() + 1)
-        });
         let mes = Rc::new(std::cell::Cell::new(0));
         ui.on_open_me({
             let mes = mes.clone();
@@ -1692,7 +2031,9 @@ mod tests {
         ui.set_verifying(false);
         click(menu_x, menu_y);
         click(menu_x, entry(2.0));
-        assert_eq!(tickets.get(), 1, "TICKET");
+        // TICKET asks what to do with whoever pairs, first.
+        assert!(ui.get_ticket_dialog(), "TICKET");
+        ui.set_ticket_dialog(false);
         click(menu_x, menu_y);
         click(menu_x, entry(3.0));
         assert!(ui.get_connecting(), "CONNECT");
@@ -1723,8 +2064,25 @@ mod tests {
         ui.set_has_dossier(true);
         render("dossier");
         ui.set_has_dossier(false);
+        ui.set_connect_name("Alice".into());
+        ui.set_can_scan(true);
         ui.set_connecting(true);
         render("connect");
+        // The camera's view of a ticket's QR code, sideways as sensors are.
+        let (code, side) = crate::qr::encode("k5ticket:abc", 8).unwrap();
+        let frame = crate::scanner::Frame {
+            luma: &code,
+            width: side,
+            height: side,
+            stride: side,
+            rotation: 90,
+        };
+        ui.set_scan_preview(slint::Image::from_rgb8(crate::scanner::preview(
+            &frame, 480,
+        )));
+        ui.set_scanning(true);
+        render("scan");
+        ui.set_scanning(false);
         ui.set_connecting(false);
         ui.set_attest_kind("x".into());
         render("attest-x");
@@ -1758,8 +2116,12 @@ mod tests {
                 &format!("{} · 2026-09-26", short(bob)),
             ),
         ])));
+        ui.set_my_name("Adrià".into());
         ui.set_show_me(true);
         render("me");
+        ui.set_asking_name(true);
+        render("name");
+        ui.set_asking_name(false);
         ui.set_show_me(false);
 
         ui.set_verifying(true);
@@ -1789,6 +2151,18 @@ mod tests {
         ui.set_pair_trusted(false);
         ui.set_pairing(true);
         render("pairing");
+        ui.set_pairing(false);
+        ui.set_ticket_name("Bob".into());
+        ui.set_ticket_dialog(true);
+        render("ticket");
+        ui.set_ticket_dialog(false);
+        let ticket = "k5ticket:eyJpZCI6IjAyNjg4YzhmNTUwYWMwMGIxZWVjMmM5ZjQyMjFmZjc0ZTZlZWM3NDNlMDY1ZjhkNmNiYzMzMTViZTkzMGI3ODYiLCJhZGRycyI6W3siUmVsYXkiOiJodHRwczovL2V1YzEtMS5yZWxheS5uMC5pcm9oLmxpbmsuLyJ9LHsiSXAiOiI4My40Ni4yNTUuMTI0OjU3NjI4In0seyJJcCI6IjE5Mi4xNjguMS4xMjI6NTc2MjgifV19";
+        ui.set_ticket_qr(slint::Image::from_rgb8(
+            crate::qr::pixel_buffer(ticket, 6).unwrap(),
+        ));
+        ui.set_showing_qr(true);
+        render("ticket-qr");
+        ui.set_showing_qr(false);
         ui.set_pairing(false);
     }
 
@@ -1854,6 +2228,70 @@ mod tests {
             _ => panic!("expected a finish request"),
         }
         assert_eq!(worker.query, "done");
+
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[test]
+    fn test_ticket_plan() {
+        let dir = std::env::temp_dir().join(format!("k5gui-plan-test-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let k5 = K5::init(&dir.join("k5.toml"))
+            .unwrap()
+            .with_db(k5lib::db::FsDb::new(dir.join("attestations")));
+        // As `start` does: keysigns are checked against it.
+        tokio::runtime::Runtime::new()
+            .unwrap()
+            .block_on(k5.ensure_self_attestation())
+            .unwrap();
+        let (tx, _rx) = mpsc::channel();
+        let attesting = Attesting {
+            notary: None,
+            presentations: dir.join("presentations"),
+        };
+        let mut worker = Worker::new(Arc::new(k5), slint::Weak::default(), attesting, tx);
+        let runtime = tokio::runtime::Builder::new_multi_thread()
+            .enable_all()
+            .build()
+            .unwrap();
+        let [bob, carol, dave] =
+            ["b.toml", "c.toml", "d.toml"].map(|name| K5::init(&dir.join(name)).unwrap().k5());
+        let plan = |keysign: Option<&str>, import, until| TicketPlan {
+            keysign: keysign.map(str::to_string),
+            import,
+            until,
+        };
+        let later = Instant::now() + Duration::from_secs(60);
+
+        // The first k5 that pairs is keysigned as the name, and its import
+        // is pending (no node here: retried by the presence checks).
+        worker.ticket_plan = Some(plan(Some("Bob"), true, later));
+        let done = worker.follow_ticket_plan(&runtime, &bob, false);
+        assert_eq!(done, ["KEYSIGNED AS Bob", "IMPORTING THEIR ATTESTATIONS"]);
+        assert!(worker.trusted.contains(&bob));
+        assert!(worker.pending_import.contains(&bob));
+
+        // Only the first one.
+        assert!(worker
+            .follow_ticket_plan(&runtime, &carol, false)
+            .is_empty());
+        assert!(!worker.trusted.contains(&carol));
+
+        // Pasting a ticket (CONNECT): the same, right away; nothing to do
+        // for a k5 already trusted.
+        let erin = K5::init(&dir.join("e.toml")).unwrap().k5();
+        let done = worker.follow_plan(&runtime, &erin, false, Some("Erin".into()), false);
+        assert_eq!(done, ["KEYSIGNED AS Erin"]);
+        assert!(worker.trusted.contains(&erin));
+        assert!(worker
+            .follow_plan(&runtime, &erin, true, Some("Again".into()), false)
+            .is_empty());
+
+        // Not once the pairing window closed.
+        worker.ticket_plan = Some(plan(Some("Dave"), false, Instant::now()));
+        assert!(worker.follow_ticket_plan(&runtime, &dave, false).is_empty());
+        assert!(!worker.trusted.contains(&dave));
 
         std::fs::remove_dir_all(&dir).unwrap();
     }
@@ -1942,6 +2380,32 @@ mod tests {
             who(&me, &attestations, &carol),
             format!("k5:{}", short(&carol))
         );
+
+        // Claimed names come first; alone, with the k5 (anyone can claim
+        // any name).
+        let [dave, erin] = ["e", "f"].map(|c| c.repeat(64));
+        let attestations = [
+            attestation(NAME, "Alice Brown", &alice),
+            attestation("X", "alice_x", &alice),
+            attestation(NAME, "Dave", &dave),
+            attestation(KEYSIGN, "David", &dave),
+            attestation(KEYSIGN, "Erin", &erin),
+        ];
+        assert_eq!(who(&me, &attestations, &alice), "Alice Brown · X:alice_x");
+        assert_eq!(card_label(&attestations, &alice), "Alice Brown · X:alice_x");
+        assert_eq!(
+            who(&me, &attestations, &dave),
+            format!("Dave (k5:{})", short(&dave))
+        );
+        assert_eq!(card_label(&attestations, &dave), "Dave");
+        // No claim: as before.
+        assert_eq!(card_label(&attestations, &erin), "Erin");
+        // Found by its claimed name.
+        let found: Vec<String> = hits(&me, &attestations, "brown", &HashSet::new())
+            .into_iter()
+            .map(|hit| hit.k5.into())
+            .collect();
+        assert_eq!(found, std::slice::from_ref(&alice));
     }
 
     #[test]
@@ -2039,6 +2503,13 @@ mod tests {
         };
         let attestations = [
             attestation(
+                NAME,
+                "Adrià",
+                &me,
+                Some(&me),
+                vec![("date", "2026-09-05T00:00:00Z")],
+            ),
+            attestation(
                 IROH,
                 &endpoint,
                 &me,
@@ -2081,6 +2552,7 @@ mod tests {
         assert_eq!(
             owned,
             [
+                row("self", "NAME : Adrià", "CLAIMED BY YOU · 2026-09-05"),
                 row("x", "X : adria0", "api.x.com · 2026-09-04"),
                 row(
                     "keysign",

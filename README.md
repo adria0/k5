@@ -165,6 +165,41 @@ to `<db>/presentations/`.
 To try two clients on one machine: `k5gui --config a.toml --db a/` and
 `k5gui --config b.toml --db b/`.
 
+## Android
+
+The same window runs on Android phones (`crates/k5android`, arm64). It is
+built with [cargo-apk](https://github.com/rust-mobile/cargo-apk) inside a
+Docker image with the Android SDK and NDK, so nothing Android needs to be
+installed:
+
+```sh
+./k5-android.sh            # target/android/release/apk/k5.apk
+./k5-android.sh --install  # and install it with adb
+```
+
+It needs Docker (Docker Desktop or OrbStack; on Apple Silicon, with Rosetta
+for x86_64 images, as the NDK only exists for x86_64 Linux). The first build
+takes a long while; later ones are incremental. The APK is signed with a debug
+key kept in a Docker volume: fine for your own devices, not for publishing.
+
+The keys and the database live in the app's private storage, created on the
+first launch. Until the app has a settings screen, the notary for `ATTEST` is
+set in the `[notary]` section of its `k5.toml`:
+
+```sh
+adb shell run-as dev.k5.app cat files/k5.toml   # the app's config
+adb logcat -s k5                               # its logs
+```
+
+```toml
+[notary]
+host = "notary.example.com"
+port = 7047      # optional
+tls = true       # optional
+```
+
+The desktop `k5gui` reads the same section when `--notary-host` is not given.
+
 ## Tools
 
 ```sh
@@ -191,6 +226,7 @@ cargo +nightly-2025-07-02 run --release -p k5cli --features zkemail -- \
 - [`k5net`](./crates/k5net/): peer to peer over iroh.
 - [`k5cli`](./crates/k5cli/): the command line, with the in-process notary.
 - [`k5gui`](./crates/k5gui/): the desktop interface (Slint).
+- [`k5android`](./crates/k5android/): the same interface as an Android app.
 
 The other crates are the TLSNotary implementation k5 builds on, and
 `vendor/mpz-core` a patched copy of one of its dependencies (see its README).

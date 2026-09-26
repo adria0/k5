@@ -210,7 +210,7 @@ fn parse_statement(statement: &str, signer: String) -> Result<KeySign, Error> {
     })
 }
 
-fn check_name(name: &str) -> Result<(), Error> {
+pub(crate) fn check_name(name: &str) -> Result<(), Error> {
     if name.trim().is_empty() || name.trim() != name || name.chars().any(char::is_control) {
         return Err(anyhow!("invalid name `{name}`"));
     }

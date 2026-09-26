@@ -24,7 +24,7 @@ use std::collections::{HashMap, HashSet};
 use anyhow::{anyhow, Context as _};
 
 use super::{
-    check, iroh, keyring, keysignparty, me, record_type, Error, Invalid, ProfileAttestation,
+    check, claim, iroh, keyring, keysignparty, me, record_type, Error, Invalid, ProfileAttestation,
 };
 use crate::{
     db::Db,
@@ -249,11 +249,13 @@ async fn store(
         Some(existing) if existing == exported.record => {
             return Ok(Outcome::Unchanged(attestation))
         }
-        // A newer iroh record replaces the older one: its k5 rotated its
-        // iroh key.
+        // A newer iroh record or name claim replaces the older one: its k5
+        // rotated its iroh key, or renamed itself.
         Some(existing)
-            if attestation.profile.platform == iroh::RECORD_TYPE
-                && iroh::is_newer(&exported.record, &existing) =>
+            if matches!(
+                attestation.profile.platform,
+                iroh::RECORD_TYPE | claim::RECORD_TYPE
+            ) && iroh::is_newer(&exported.record, &existing) =>
         {
             true
         }

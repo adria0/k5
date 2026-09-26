@@ -313,6 +313,48 @@ component TermInput inherits TextInput {
     }
 }
 
+// `[X] LABEL`: a check box.
+component TermCheck {
+    in property <string> text;
+    in property <bool> enabled: true;
+    in-out property <bool> checked;
+    min-height: 36px;
+    HorizontalLayout {
+        spacing: 12px;
+        VerticalLayout {
+            alignment: center;
+            Rectangle {
+                width: 24px;
+                height: 24px;
+                border-width: 2px;
+                border-color: root.enabled ? Palette.ink : Palette.faint;
+                // A filled square when checked.
+                Rectangle {
+                    width: 12px;
+                    height: 12px;
+                    background: root.checked ? (root.enabled ? Palette.ink : Palette.faint) : transparent;
+                }
+            }
+        }
+
+        Text {
+            text: root.text;
+            font-size: 22px;
+            color: root.enabled ? Palette.text : Palette.faint;
+            vertical-alignment: center;
+            wrap: word-wrap;
+        }
+    }
+
+    TouchArea {
+        enabled: root.enabled;
+        mouse-cursor: pointer;
+        clicked => {
+            root.checked = !root.checked;
+        }
+    }
+}
+
 component TermButton {
     in property <string> text;
     in property <bool> enabled: true;
@@ -696,6 +738,30 @@ export component AppWindow inherits Window {
     in-out property <string> draft;
     // The paste-a-ticket dialog is open.
     in-out property <bool> connecting;
+    // The make-a-ticket dialog is open, with what to do when someone pairs
+    // with the ticket.
+    in-out property <bool> ticket-dialog;
+    in-out property <bool> ticket-keysign: true;
+    in-out property <string> ticket-name;
+    in-out property <bool> ticket-import: true;
+    // The ticket made, as a QR code, shown until closed.
+    in property <image> ticket-qr;
+    in-out property <bool> showing-qr;
+    // The ticket in the connect dialog.
+    in-out property <string> connect-text;
+    // The name the local k5 claims (empty if none), and the dialog asking
+    // for it.
+    in-out property <string> my-name;
+    in-out property <bool> asking-name;
+    // A camera can read tickets from QR codes.
+    in property <bool> can-scan;
+    // Scanning a QR code with the camera, and what it sees.
+    in-out property <bool> scanning;
+    in property <image> scan-preview;
+    // The same for the k5 of a ticket pasted in the connect dialog.
+    in-out property <bool> connect-keysign: true;
+    in-out property <string> connect-name;
+    in-out property <bool> connect-import: true;
     // The local k5, in full.
     in property <string> me-k5;
     // The notary that attests profiles (`host:port`), empty if none is
@@ -740,8 +806,19 @@ export component AppWindow inherits Window {
     callback select(string);
     callback rescan();
     callback sync(string);
-    callback copy-ticket();
-    callback connect-ticket(string);
+    // Make a ticket and copy it: with a name, keysign as that name the first
+    // k5 that pairs with it; with import, import its attestations.
+    callback copy-ticket(string, bool);
+    // Fill the connect dialog with the ticket on the clipboard.
+    callback paste-ticket();
+    // Claim a name for the local k5.
+    callback claim-name(string);
+    // Start and stop the camera, to read a ticket from a QR code.
+    callback start-scan();
+    callback stop-scan();
+    // Pair with a ticket: ticket; with a name, keysign the peer as that
+    // name; with import, import its attestations.
+    callback connect-ticket(string, string, bool);
     callback open-chat(string);
     callback close-chat();
     // Send a message in a conversation: to, message.
@@ -760,9 +837,10 @@ export component AppWindow inherits Window {
     callback keysign(string, string);
 
     title: "K5";
-    // A phone screen.
-    width: 430px;
-    height: 932px;
+    // A phone screen: the desktop window's size; on Android the window fills
+    // the screen.
+    preferred-width: 430px;
+    preferred-height: 932px;
     background: Palette.paper;
     default-font-family: "VT323";
 
@@ -849,9 +927,12 @@ export component AppWindow inherits Window {
                     root.toggle-auto-sync();
                 }
                 ticket => {
-                    root.copy-ticket();
+                    root.ticket-name = "";
+                    root.ticket-dialog = true;
                 }
                 connect => {
+                    root.connect-name = "";
+                    root.connect-text = "";
                     root.connecting = true;
                 }
                 attest(kind) => {
@@ -946,11 +1027,12 @@ export component AppWindow inherits Window {
                         spacing: 8px;
                         for bubble in root.bubbles: HorizontalLayout {
                             alignment: bubble.outgoing ? LayoutAlignment.end : LayoutAlignment.start;
+                            // A gutter on the other side keeps bubbles off the
+                            // full width, without reading the window's width
+                            // (which, not fixed, depends on this layout).
+                            padding-left: bubble.outgoing ? 64px : 0px;
+                            padding-right: bubble.outgoing ? 0px : 64px;
                             Rectangle {
-                                // 80% of the content width (the window, less its
-                                // padding): not the list's, which depends on
-                                // the bubbles.
-                                max-width: (root.width - 40px) * 0.8;
                                 border-width: 2px;
                                 border-color: Palette.ink;
                                 background: bubble.outgoing ? Palette.paper-hi : transparent;
@@ -1140,10 +1222,18 @@ export component AppWindow inherits Window {
             vertical-stretch: 1;
             HorizontalLayout {
                 alignment: start;
+                spacing: 12px;
                 TermButton {
                     text: "< BACK";
                     clicked => {
                         root.show-me = false;
+                    }
+                }
+
+                TermButton {
+                    text: root.my-name == "" ? "SET NAME" : "RENAME";
+                    clicked => {
+                        root.asking-name = true;
                     }
                 }
             }
@@ -1161,7 +1251,8 @@ export component AppWindow inherits Window {
                     alignment: center;
                     Text {
                         color: Palette.text;
-                        text: "ME";
+                        text: root.my-name != "" ? root.my-name : "ME";
+                        overflow: elide;
                         font-family: "Doto";
                         font-weight: 900;
                         font-size: 40px;
@@ -1737,13 +1828,13 @@ export component AppWindow inherits Window {
 
         Rectangle {
             width: parent.width - 32px;
-            height: 300px;
+            height: connect-layout.preferred-height;
             background: Palette.paper;
             border-width: 3px;
             border-color: Palette.ink;
-            VerticalLayout {
+            connect-layout := VerticalLayout {
                 padding: 18px;
-                spacing: 14px;
+                spacing: 12px;
                 Text {
                     color: Palette.text;
                     text: "CONNECT";
@@ -1760,15 +1851,16 @@ export component AppWindow inherits Window {
                 }
 
                 Rectangle {
-                    vertical-stretch: 1;
+                    height: 110px;
                     border-width: 2px;
                     border-color: Palette.ink;
                     clip: true;
-                    ticket := TermInput {
+                    TermInput {
                         x: 10px;
                         y: 8px;
                         width: parent.width - 20px;
                         height: parent.height - 16px;
+                        text <=> root.connect-text;
                         single-line: false;
                         wrap: char-wrap;
                         font-size: 20px;
@@ -1776,6 +1868,67 @@ export component AppWindow inherits Window {
                             self.focus();
                         }
                     }
+                }
+
+                HorizontalLayout {
+                    alignment: start;
+                    spacing: 12px;
+                    TermButton {
+                        text: "PASTE";
+                        clicked => {
+                            root.paste-ticket();
+                        }
+                    }
+
+                    if root.can-scan: TermButton {
+                        text: "SCAN QR";
+                        clicked => {
+                            root.scanning = true;
+                            root.start-scan();
+                        }
+                    }
+                }
+
+                TermCheck {
+                    text: "KEYSIGN THEM AS:";
+                    checked <=> root.connect-keysign;
+                }
+
+                Rectangle {
+                    height: 44px;
+                    border-width: 2px;
+                    border-color: root.connect-keysign ? Palette.ink : Palette.faint;
+                    clip: true;
+                    TermInput {
+                        x: 10px;
+                        width: parent.width - 20px;
+                        height: parent.height;
+                        text <=> root.connect-name;
+                        enabled: root.connect-keysign;
+                        font-size: 24px;
+                        vertical-alignment: center;
+                    }
+
+                    if root.connect-name == "": Text {
+                        x: 10px;
+                        height: parent.height;
+                        vertical-alignment: center;
+                        text: "THEIR NAME";
+                        font-size: 24px;
+                        color: root.connect-keysign ? Palette.dim : Palette.faint;
+                    }
+                }
+
+                TermCheck {
+                    text: "IMPORT THEIR ATTESTATIONS";
+                    checked <=> root.connect-import;
+                }
+
+                if root.connect-keysign: Text {
+                    color: Palette.dim;
+                    text: "THEY ARE KEYSIGNED WITHOUT COMPARING THE CHECK PHRASE: USE ONLY A TICKET THEY GAVE YOU.";
+                    font-size: 18px;
+                    wrap: word-wrap;
                 }
 
                 HorizontalLayout {
@@ -1791,10 +1944,158 @@ export component AppWindow inherits Window {
                     TermButton {
                         text: "CONNECT";
                         primary: true;
-                        enabled: ticket.text != "";
+                        enabled: root.connect-text != "" && (!root.connect-keysign || root.connect-name != "");
                         clicked => {
-                            root.connect-ticket(ticket.text);
+                            root.connect-ticket(root.connect-text, root.connect-keysign ? root.connect-name : "", root.connect-import);
                             root.connecting = false;
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    // The ticket made, as a QR code to scan from the other device.
+    if root.showing-qr: Rectangle {
+        background: Palette.shade;
+        TouchArea { }
+
+        Rectangle {
+            width: parent.width - 32px;
+            height: qr-layout.preferred-height;
+            background: Palette.paper;
+            border-width: 3px;
+            border-color: Palette.ink;
+            qr-layout := VerticalLayout {
+                padding: 18px;
+                spacing: 12px;
+                Text {
+                    color: Palette.text;
+                    text: "TICKET";
+                    font-family: "Doto";
+                    font-weight: 900;
+                    font-size: 32px;
+                }
+
+                Text {
+                    color: Palette.dim;
+                    text: "SCAN IT WITH K5 ON THE OTHER DEVICE (CONNECT > SCAN QR), OR PASTE IT THERE: IT IS ON THE CLIPBOARD TOO.";
+                    font-size: 20px;
+                    wrap: word-wrap;
+                }
+
+                Image {
+                    source: root.ticket-qr;
+                    // Square, as wide as the dialog allows.
+                    height: self.width;
+                    image-rendering: pixelated;
+                }
+
+                HorizontalLayout {
+                    alignment: end;
+                    TermButton {
+                        text: "CLOSE";
+                        primary: true;
+                        clicked => {
+                            root.showing-qr = false;
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    // Make-a-ticket dialog: what to do with the k5 that pairs with it.
+    if root.ticket-dialog: Rectangle {
+        background: Palette.shade;
+        TouchArea { }
+
+        Rectangle {
+            width: parent.width - 32px;
+            height: ticket-layout.preferred-height;
+            background: Palette.paper;
+            border-width: 3px;
+            border-color: Palette.ink;
+            ticket-layout := VerticalLayout {
+                padding: 18px;
+                spacing: 12px;
+                Text {
+                    color: Palette.text;
+                    text: "TICKET";
+                    font-family: "Doto";
+                    font-weight: 900;
+                    font-size: 32px;
+                }
+
+                Text {
+                    color: Palette.dim;
+                    text: "WHEN SOMEONE PAIRS WITH THIS TICKET:";
+                    font-size: 20px;
+                    wrap: word-wrap;
+                }
+
+                TermCheck {
+                    text: "KEYSIGN THEM AS:";
+                    checked <=> root.ticket-keysign;
+                }
+
+                Rectangle {
+                    height: 44px;
+                    border-width: 2px;
+                    border-color: root.ticket-keysign ? Palette.ink : Palette.faint;
+                    clip: true;
+                    TermInput {
+                        x: 10px;
+                        width: parent.width - 20px;
+                        height: parent.height;
+                        text <=> root.ticket-name;
+                        enabled: root.ticket-keysign;
+                        font-size: 24px;
+                        vertical-alignment: center;
+                        init => {
+                            self.focus();
+                        }
+                    }
+
+                    if root.ticket-name == "": Text {
+                        x: 10px;
+                        height: parent.height;
+                        vertical-alignment: center;
+                        text: "THEIR NAME";
+                        font-size: 24px;
+                        color: root.ticket-keysign ? Palette.dim : Palette.faint;
+                    }
+                }
+
+                TermCheck {
+                    text: "IMPORT THEIR ATTESTATIONS";
+                    checked <=> root.ticket-import;
+                }
+
+                Text {
+                    color: Palette.dim;
+                    text: root.ticket-keysign ? "ONLY THE FIRST K5 THAT PAIRS, IN THE NEXT 10 MINUTES. IT IS KEYSIGNED WITHOUT COMPARING THE CHECK PHRASE: GIVE THE TICKET ONLY TO THEM." : "ONLY THE FIRST K5 THAT PAIRS, IN THE NEXT 10 MINUTES.";
+                    font-size: 18px;
+                    wrap: word-wrap;
+                }
+
+                HorizontalLayout {
+                    alignment: end;
+                    spacing: 12px;
+                    TermButton {
+                        text: "CANCEL";
+                        clicked => {
+                            root.ticket-dialog = false;
+                        }
+                    }
+
+                    TermButton {
+                        text: "COPY TICKET";
+                        primary: true;
+                        enabled: !root.busy && (!root.ticket-keysign || root.ticket-name != "");
+                        clicked => {
+                            root.copy-ticket(root.ticket-keysign ? root.ticket-name : "", root.ticket-import);
+                            root.ticket-dialog = false;
                         }
                     }
                 }
@@ -1904,6 +2205,138 @@ export component AppWindow inherits Window {
                         clicked => {
                             root.keysign(root.pair-k5, root.pair-name);
                             root.pairing = false;
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    // Reading a ticket's QR code with the camera: the preview, until a
+    // ticket is found (it fills the connect dialog) or CANCEL.
+    if root.scanning: Rectangle {
+        background: Palette.paper;
+        TouchArea { }
+
+        VerticalLayout {
+            padding: 20px;
+            padding-top: 40px;
+            spacing: 14px;
+            Text {
+                color: Palette.text;
+                text: "SCAN";
+                font-family: "Doto";
+                font-weight: 900;
+                font-size: 40px;
+            }
+
+            Text {
+                color: Palette.dim;
+                text: "POINT THE CAMERA AT THE TICKET'S QR CODE, ON THE OTHER DEVICE.";
+                font-size: 22px;
+                wrap: word-wrap;
+            }
+
+            Rectangle {
+                vertical-stretch: 1;
+                border-width: 3px;
+                border-color: Palette.ink;
+                background: Palette.ink;
+                Image {
+                    width: parent.width - 6px;
+                    height: parent.height - 6px;
+                    source: root.scan-preview;
+                    image-fit: contain;
+                }
+            }
+
+            HorizontalLayout {
+                alignment: end;
+                TermButton {
+                    text: "CANCEL";
+                    clicked => {
+                        root.scanning = false;
+                        root.stop-scan();
+                    }
+                }
+            }
+        }
+    }
+
+    // The name the local k5 claims for itself: asked at start if there is
+    // none, and from the ME screen.
+    if root.asking-name: Rectangle {
+        background: Palette.shade;
+        TouchArea { }
+
+        Rectangle {
+            width: parent.width - 32px;
+            height: name-layout.preferred-height;
+            background: Palette.paper;
+            border-width: 3px;
+            border-color: Palette.ink;
+            name-layout := VerticalLayout {
+                padding: 18px;
+                spacing: 12px;
+                Text {
+                    color: Palette.text;
+                    text: "WHO ARE YOU?";
+                    font-family: "Doto";
+                    font-weight: 900;
+                    font-size: 32px;
+                }
+
+                Text {
+                    color: Palette.dim;
+                    text: "YOUR NAME, AS OTHERS WILL SEE IT ON YOUR CARD. IT IS SIGNED BY YOUR K5 AND SHARED WITH YOUR PEERS.";
+                    font-size: 20px;
+                    wrap: word-wrap;
+                }
+
+                Rectangle {
+                    height: 44px;
+                    border-width: 2px;
+                    border-color: Palette.ink;
+                    clip: true;
+                    TermInput {
+                        x: 10px;
+                        width: parent.width - 20px;
+                        height: parent.height;
+                        text <=> root.my-name;
+                        font-size: 24px;
+                        vertical-alignment: center;
+                        init => {
+                            self.focus();
+                        }
+                    }
+
+                    if root.my-name == "": Text {
+                        x: 10px;
+                        height: parent.height;
+                        vertical-alignment: center;
+                        text: "YOUR NAME";
+                        font-size: 24px;
+                        color: Palette.dim;
+                    }
+                }
+
+                HorizontalLayout {
+                    alignment: end;
+                    spacing: 12px;
+                    TermButton {
+                        text: "LATER";
+                        clicked => {
+                            root.asking-name = false;
+                        }
+                    }
+
+                    TermButton {
+                        text: "SAVE";
+                        primary: true;
+                        enabled: root.my-name != "" && !root.busy;
+                        clicked => {
+                            root.claim-name(root.my-name);
+                            root.asking-name = false;
                         }
                     }
                 }
