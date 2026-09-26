@@ -24,6 +24,7 @@
 
 use std::path::Path;
 
+use anyhow::{anyhow, Context as _};
 use pgp::{
     composed::{
         Deserializable, EncryptionCaps, KeyType, SecretKeyParamsBuilder, SignedPublicKey,
@@ -34,7 +35,7 @@ use pgp::{
 use rand::rngs::OsRng;
 use serde::{Deserialize, Serialize};
 
-pub type Error = Box<dyn std::error::Error>;
+pub use crate::Error;
 
 const NAME: &str = "key";
 const ALGORITHM: &str = "MlDsa65Ed25519+MlKem768X25519";
@@ -76,7 +77,7 @@ impl Keys {
             .secret_subkeys
             .first()
             .map(SignedSecretSubKey::signed_public_key)
-            .ok_or_else(|| "the key has no encryption subkey".into())
+            .ok_or_else(|| anyhow!("the key has no encryption subkey"))
     }
 
     /// A new random pair of keys.
@@ -106,23 +107,22 @@ impl Keys {
     fn from_toml(value: toml::Value) -> Result<Self, Error> {
         let config: KeyConfig = value.try_into()?;
         if config.algorithm != ALGORITHM {
-            return Err(format!(
+            return Err(anyhow!(
                 "unsupported algorithm `{}`, expected `{ALGORITHM}`",
                 config.algorithm
-            )
-            .into());
+            ));
         }
 
         let (secret, _) = SignedSecretKey::from_string(&config.secret_key)
-            .map_err(|e| format!("invalid secret_key: {e}"))?;
+            .map_err(|e| anyhow!("invalid secret_key: {e}"))?;
         secret
             .verify_bindings()
-            .map_err(|e| format!("invalid secret key: {e}"))?;
+            .map_err(|e| anyhow!("invalid secret key: {e}"))?;
 
         let keys = Self { secret };
         if let Some(k5) = &config.k5 {
             if !k5.eq_ignore_ascii_case(&keys.k5()) {
-                return Err("k5 does not match the secret key".into());
+                return Err(anyhow!("k5 does not match the secret key"));
             }
         }
 
@@ -160,11 +160,10 @@ pub fn store(path: &Path, keys: &Keys, settings: toml::Table) -> Result<(), Erro
     config.insert(NAME.to_string(), keys.to_toml()?);
     write_private(path, &toml::to_string(&config)?, true).map_err(|e| {
         if e.kind() == std::io::ErrorKind::AlreadyExists {
-            format!(
+            anyhow!(
                 "{} already exists: keys are not overwritten",
                 path.display()
             )
-            .into()
         } else {
             Error::from(e)
         }
@@ -179,18 +178,17 @@ pub fn load(path: &Path) -> Result<Keys, Error> {
     let mut config: toml::Table = match std::fs::read_to_string(path) {
         Ok(content) => content
             .parse()
-            .map_err(|e| format!("invalid {}: {e}", path.display()))?,
+            .map_err(|e| anyhow!("invalid {}: {e}", path.display()))?,
         Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
-            return Err(format!(
+            return Err(anyhow!(
                 "{} not found: run `k5 init` to create your keys",
                 path.display()
-            )
-            .into())
+            ))
         }
         Err(e) => return Err(e.into()),
     };
 
-    let value = config.get(NAME).cloned().ok_or_else(|| {
+    let value = config.get(NAME).cloned().with_context(|| {
         format!(
             "invalid {}: missing [{NAME}] section (this looks like a k5.toml from before \
              the switch to OpenPGP keys; run `k5 init` with a new config file)",
@@ -198,7 +196,7 @@ pub fn load(path: &Path) -> Result<Keys, Error> {
         )
     })?;
     let keys = Keys::from_toml(value)
-        .map_err(|e| format!("invalid [{NAME}] in {}: {e}", path.display()))?;
+        .map_err(|e| anyhow!("invalid [{NAME}] in {}: {e}", path.display()))?;
 
     let stored = keys.to_toml()?;
     if config.get(NAME) != Some(&stored) {
@@ -219,7 +217,7 @@ pub fn load_section(path: &Path, name: &str) -> Result<Option<toml::Value>, Erro
 /// the others.
 pub fn store_section(path: &Path, name: &str, value: toml::Value) -> Result<(), Error> {
     if name == NAME {
-        return Err(format!("the [{NAME}] section is not stored this way").into());
+        return Err(anyhow!("the [{NAME}] section is not stored this way"));
     }
     let mut config = read_config(path)?;
     config.insert(name.to_string(), value);
@@ -229,9 +227,9 @@ pub fn store_section(path: &Path, name: &str, value: toml::Value) -> Result<(), 
 }
 
 fn read_config(path: &Path) -> Result<toml::Table, Error> {
-    Ok(std::fs::read_to_string(path)?
+    std::fs::read_to_string(path)?
         .parse()
-        .map_err(|e| format!("invalid {}: {e}", path.display()))?)
+        .map_err(|e| anyhow!("invalid {}: {e}", path.display()))
 }
 
 /// A new random pair of keys.
@@ -240,23 +238,11 @@ pub fn test_keys() -> Keys {
     Keys::generate().unwrap()
 }
 
-/// Writes a file readable only by the owner. With `create_new`, fails if the
-/// file exists.
+/// Writes the config file, readable only by the owner, atomically: it holds
+/// the secret key, so an interrupted write must never leave it truncated.
+/// With `create_new`, fails if the file exists.
 fn write_private(path: &Path, content: &str, create_new: bool) -> std::io::Result<()> {
-    use std::io::Write;
-
-    let mut options = std::fs::OpenOptions::new();
-    if create_new {
-        options.write(true).create_new(true);
-    } else {
-        options.write(true).create(true).truncate(true);
-    }
-    #[cfg(unix)]
-    std::os::unix::fs::OpenOptionsExt::mode(&mut options, 0o600);
-
-    options.open(path)?.write_all(content.as_bytes())?;
-
-    Ok(())
+    crate::db::write_atomic(path, content.as_bytes(), true, create_new)
 }
 
 #[cfg(test)]

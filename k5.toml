@@ -1,6 +1,9 @@
+[iroh]
+secret_key = "b7fe8a6251a71de406965acdb18ae34e1e064c0d5c738a0a45155b6e815b1a34"
+
 [key]
-k5 = "f1e98004580d1f9bb6c3a316dd1bbf881482f5c1ad59add93271519819e01afb"
 algorithm = "MlDsa65Ed25519+MlKem768X25519"
+k5 = "f1e98004580d1f9bb6c3a316dd1bbf881482f5c1ad59add93271519819e01afb"
 secret_key = """
 -----BEGIN PGP PRIVATE KEY BLOCK-----
 

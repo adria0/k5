@@ -24,6 +24,7 @@ use std::{
     path::PathBuf,
 };
 
+use anyhow::anyhow;
 use pgp::{
     composed::{EncryptionCaps, KeyType, SecretKeyParamsBuilder, SubkeyParamsBuilder},
     types::{KeyDetails, KeyVersion},
@@ -118,14 +119,16 @@ pub fn parse_seed(seed: &str) -> Result<u64, Error> {
         None => seed.parse(),
     };
 
-    parsed.map_err(|_| format!("invalid seed `{seed}`: expected hex (0x...) or decimal").into())
+    parsed.map_err(|_| anyhow!("invalid seed `{seed}`: expected hex (0x...) or decimal"))
 }
 
 /// Generates `n` identities and their keysigns from `seed`, storing the
 /// attestations in `db`, then audits the result.
 pub async fn run(me: &Keys, db: &dyn Db, n: usize, seed: u64) -> Result<Summary, Error> {
     if !(2..=MAX_IDS).contains(&n) {
-        return Err(format!("the number of identities must be between 2 and {MAX_IDS}").into());
+        return Err(anyhow!(
+            "the number of identities must be between 2 and {MAX_IDS}"
+        ));
     }
 
     let mut rng = Rng::new(seed);
@@ -189,7 +192,6 @@ pub async fn run(me: &Keys, db: &dyn Db, n: usize, seed: u64) -> Result<Summary,
         let signer = edge.signer.map_or(me, |signer| &identities[signer].keys);
         let subject = &identities[edge.subject];
         keysignparty::create(signer, &subject.keys.k5(), &subject.name, true)
-            .map_err(|e| e.to_string())
     });
 
     let mut files = Vec::with_capacity(edges.len());
@@ -200,9 +202,7 @@ pub async fn run(me: &Keys, db: &dyn Db, n: usize, seed: u64) -> Result<Summary,
     }
 
     // Self attestations of the identities, with their encryption keys.
-    let me_records = parallel_map(&identities, |identity| {
-        me::create(&identity.keys, true).map_err(|e| e.to_string())
-    });
+    let me_records = parallel_map(&identities, |identity| me::create(&identity.keys, true));
     for (identity, record) in identities.iter().zip(me_records) {
         db.put(&me::name(&identity.keys.k5()), &record?).await?;
     }
@@ -218,7 +218,7 @@ pub async fn run(me: &Keys, db: &dyn Db, n: usize, seed: u64) -> Result<Summary,
         })
         .collect();
     let fake_records = parallel_map(&fakes, |(index, platform, user)| {
-        fake::create(&identities[*index].keys, platform, user).map_err(|e| e.to_string())
+        fake::create(&identities[*index].keys, platform, user)
     });
     let mut fake_files = Vec::with_capacity(fakes.len());
     for record in fake_records {
@@ -287,9 +287,9 @@ async fn audit(
         records.push((file, get(db, file).await?));
     }
     let verified = parallel_map(&records, |(path, record)| {
-        match attestations::verify(record, "", &keyring).map_err(|e| format!("{path}: {e}"))? {
+        match attestations::verify(record, "", &keyring).map_err(|e| anyhow!("{path}: {e:#}"))? {
             Attested::KeySign(keysign) if keysign.fake => Ok(keysign),
-            _ => Err(format!("{path}: not a fake keysign")),
+            _ => Err(anyhow!("{path}: not a fake keysign")),
         }
     });
 
@@ -306,7 +306,7 @@ async fn audit(
             || keysign.subject != subject.keys.k5()
             || keysign.name != subject.name
         {
-            return Err(format!("{path}: unexpected keysign").into());
+            return Err(anyhow!("{path}: unexpected keysign"));
         }
 
         if let Some(signer) = edge.signer {
@@ -318,7 +318,7 @@ async fn audit(
     for (index, identity) in identities.iter().enumerate() {
         let degree = degrees.get(&index).copied().unwrap_or_default();
         if !(1..=MAX_CONNECTIONS).contains(&degree) {
-            return Err(format!("{} keysigns {degree} identities", identity.name).into());
+            return Err(anyhow!("{} keysigns {degree} identities", identity.name));
         }
     }
 
@@ -329,9 +329,9 @@ async fn audit(
         me_records.push((file, record));
     }
     let verified = parallel_map(&me_records, |(path, record)| {
-        match attestations::verify(record, "", &keyring).map_err(|e| format!("{path}: {e}"))? {
+        match attestations::verify(record, "", &keyring).map_err(|e| anyhow!("{path}: {e:#}"))? {
             Attested::Me(me) if me.fake => Ok(me),
-            _ => Err(format!("{path}: not a fake self attestation")),
+            _ => Err(anyhow!("{path}: not a fake self attestation")),
         }
     });
     for (identity, me) in identities.iter().zip(verified) {
@@ -340,11 +340,10 @@ async fn audit(
             || me.encryption_fingerprint()
                 != Some(identity.keys.encryption_subkey()?.fingerprint().to_string())
         {
-            return Err(format!(
+            return Err(anyhow!(
                 "self attestation of {} does not match its keys",
                 identity.name
-            )
-            .into());
+            ));
         }
     }
 
@@ -355,34 +354,36 @@ async fn audit(
     let verified = parallel_map(&fake_records, |(path, record)| match attestations::verify(
         record, "", &keyring,
     )
-    .map_err(|e| format!("{path}: {e}"))?
+    .map_err(|e| anyhow!("{path}: {e:#}"))?
     {
         Attested::Fake(fake) => Ok(fake),
-        _ => Err(format!("{path}: not a fake profile attestation")),
+        _ => Err(anyhow!("{path}: not a fake profile attestation")),
     });
     let mut fake_counts = vec![0; identities.len()];
     for (&(index, platform, user), fake) in fakes.iter().zip(verified) {
         let fake = fake?;
         let identity = &identities[index];
         if fake.k5 != identity.keys.k5() || fake.platform != platform || fake.user != user {
-            return Err(format!(
+            return Err(anyhow!(
                 "unexpected fake {platform} attestation of {}",
                 identity.name
-            )
-            .into());
+            ));
         }
         fake_counts[index] += 1;
     }
     for (identity, count) in identities.iter().zip(fake_counts) {
         if !(1..=FAKE_PROFILES.len()).contains(&count) {
-            return Err(format!("{} has {count} fake profile attestations", identity.name).into());
+            return Err(anyhow!(
+                "{} has {count} fake profile attestations",
+                identity.name
+            ));
         }
     }
 
     let trusted = export::trusted(&me.k5(), attestations.iter());
     for identity in identities {
         if !trusted.contains(&identity.keys.k5()) {
-            return Err(format!("{} is not reachable from your k5", identity.name).into());
+            return Err(anyhow!("{} is not reachable from your k5", identity.name));
         }
     }
 
@@ -393,7 +394,7 @@ async fn audit(
 async fn get(db: &dyn Db, name: &str) -> Result<String, Error> {
     db.get(name)
         .await?
-        .ok_or_else(|| format!("{} is missing", db.location(name)).into())
+        .ok_or_else(|| anyhow!("{} is missing", db.location(name)))
 }
 
 /// Checks that an identity config file holds the expected keys and name.
@@ -404,12 +405,14 @@ fn check_identity(identity: &Identity) -> Result<(), Error> {
         || loaded.encryption_subkey()?.fingerprint()
             != identity.keys.encryption_subkey()?.fingerprint()
     {
-        return Err(format!("{path} does not hold the identity derived from the seed").into());
+        return Err(anyhow!(
+            "{path} does not hold the identity derived from the seed"
+        ));
     }
 
     let config: toml::Table = std::fs::read_to_string(&identity.path)?.parse()?;
     if config.get("name").and_then(toml::Value::as_str) != Some(identity.name.as_str()) {
-        return Err(format!("{path} is not the identity of {}", identity.name).into());
+        return Err(anyhow!("{path} is not the identity of {}", identity.name));
     }
 
     Ok(())

@@ -12,6 +12,7 @@ workspace = true
 zkemail = ["dep:plonky2-zkemail"]
 
 [dependencies]
+anyhow = { workspace = true }
 async-trait = { workspace = true }
 notary-client = { workspace = true }
 tlsn-common = { workspace = true }

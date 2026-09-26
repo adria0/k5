@@ -16,8 +16,11 @@
 // message). A fake attestation proves nothing about the profile: it is only
 // accepted as fake, and is always displayed as such.
 
+use anyhow::{anyhow, Context as _};
+
 use super::{Error, Profile};
 use crate::{
+    k5id::K5Id,
     key::Keys,
     message::{self, Keyring},
 };
@@ -95,16 +98,16 @@ pub fn create(keys: &Keys, platform: &str, user: &str) -> Result<(String, String
 pub fn verify(record: &str, keyring: &Keyring) -> Result<Fake, Error> {
     let (_, armored) = record
         .split_once("\n# statement\n")
-        .ok_or("fake attestation has no `# statement` section")?;
+        .context("fake attestation has no `# statement` section")?;
     let verified = message::verify(armored, keyring)?;
 
     let fake = parse_statement(&verified.msg)?;
     if !fake.k5.eq_ignore_ascii_case(&verified.from) {
-        return Err(format!(
+        return Err(anyhow!(
             "fake attestation of k5:{} is signed by k5:{}",
-            fake.k5, verified.from
-        )
-        .into());
+            fake.k5,
+            verified.from
+        ));
     }
 
     Ok(fake)
@@ -123,27 +126,28 @@ fn parse_statement(statement: &str) -> Result<Fake, Error> {
         lines
             .next()
             .and_then(|line| line.strip_prefix(prefix))
-            .ok_or_else(|| format!("invalid fake attestation statement: expected `{prefix}`"))
+            .ok_or_else(|| anyhow!("invalid fake attestation statement: expected `{prefix}`"))
     };
 
     if !field(STATEMENT_HEADER)?.is_empty() {
-        return Err("invalid fake attestation statement header".into());
+        return Err(anyhow!("invalid fake attestation statement header"));
     }
-    let k5 = field("k5:")?.to_ascii_lowercase();
-    if k5.len() != 64 || !k5.bytes().all(|b| b.is_ascii_hexdigit()) {
-        return Err(format!("invalid k5 `{k5}`").into());
-    }
+    let k5 = K5Id::parse_strict(field("k5:")?)?.into();
     let platform = field("platform:")?.to_string();
     let user = field("user:")?.to_string();
     let claimed_server = field("server:")?.to_string();
     let date = field("date:")?.to_string();
     if lines.next().is_some() {
-        return Err("invalid fake attestation statement: unexpected content".into());
+        return Err(anyhow!(
+            "invalid fake attestation statement: unexpected content"
+        ));
     }
 
     let (platform, server) = server(&platform, &user)?;
     if claimed_server != server {
-        return Err(format!("the server of a {platform} profile is not `{claimed_server}`").into());
+        return Err(anyhow!(
+            "the server of a {platform} profile is not `{claimed_server}`"
+        ));
     }
 
     Ok(Fake {
@@ -160,7 +164,7 @@ fn server(platform: &str, user: &str) -> Result<(&'static str, String), Error> {
     let &(platform, server) = PLATFORMS
         .iter()
         .find(|(name, _)| *name == platform)
-        .ok_or_else(|| format!("unknown platform `{platform}`"))?;
+        .with_context(|| format!("unknown platform `{platform}`"))?;
 
     let valid_user = !user.is_empty()
         && user
@@ -169,14 +173,16 @@ fn server(platform: &str, user: &str) -> Result<(&'static str, String), Error> {
         && !user.starts_with('.')
         && !user.contains("..");
     if !valid_user {
-        return Err(format!("invalid {platform} user `{user}`").into());
+        return Err(anyhow!("invalid {platform} user `{user}`"));
     }
 
     match server {
         Some(server) => Ok((platform, server.to_string())),
         // A website is a domain without subdomain.
         None if user.split('.').count() == 2 => Ok((platform, user.to_string())),
-        None => Err(format!("invalid site `{user}`: expected a domain without subdomain").into()),
+        None => Err(anyhow!(
+            "invalid site `{user}`: expected a domain without subdomain"
+        )),
     }
 }
 

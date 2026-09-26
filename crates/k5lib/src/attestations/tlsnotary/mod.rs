@@ -8,6 +8,7 @@
 
 use std::time::Duration;
 
+use anyhow::{anyhow, Context as _};
 use base64::prelude::*;
 use http_body_util::Empty;
 use hyper::{body::Bytes, Request};
@@ -179,14 +180,16 @@ impl Record<'_> {
 /// Returns the base64 `# binary` section of an attestation record.
 fn record_binary(record: &str) -> Result<&str, Error> {
     if !record.starts_with("# info") {
-        return Err("not an attestation record: missing `# info` section".into());
+        return Err(anyhow!(
+            "not an attestation record: missing `# info` section"
+        ));
     }
 
-    Ok(record
+    record
         .split_once("\n# binary\n")
         .map(|(_, section)| section.trim())
         .filter(|section| !section.is_empty())
-        .ok_or("attestation record has no `# binary` section")?)
+        .context("attestation record has no `# binary` section")
 }
 
 /// Splits an HTTP message into its head (with `\n` line endings) and body.
@@ -203,11 +206,12 @@ pub fn verify(record: &str, notary_key: &str) -> Result<Verified, Error> {
 
     let verified = verify_presentation(presentation)?;
     if !verified.key_hex.eq_ignore_ascii_case(notary_key) {
-        return Err(format!(
+        return Err(anyhow!(
             "presentation is signed with unexpected {} key {}, expected {}",
-            verified.alg, verified.key_hex, notary_key
-        )
-        .into());
+            verified.alg,
+            verified.key_hex,
+            notary_key
+        ));
     }
 
     Ok(verified)
@@ -304,7 +308,7 @@ async fn notarize(
     let response = request_sender
         .send_request(request)
         .await
-        .map_err(|e| size_hint(&e))?;
+        .map_err(|e| anyhow::Error::msg(size_hint(&e)))?;
 
     progress(&format!(
         "Got a response from the server: {}",
@@ -312,15 +316,17 @@ async fn notarize(
     ));
 
     if !response.status().is_success() {
-        return Err(format!("unexpected status: {}", response.status()).into());
+        return Err(anyhow!("unexpected status: {}", response.status()));
     }
 
     // Read the whole body so the full response ends up in the transcript.
     http_body_util::BodyExt::collect(response.into_body())
         .await
-        .map_err(|e| size_hint(&e))?;
+        .map_err(|e| anyhow::Error::msg(size_hint(&e)))?;
 
-    let mut prover = prover_task.await?.map_err(|e| size_hint(&e))?;
+    let mut prover = prover_task
+        .await?
+        .map_err(|e| anyhow::Error::msg(size_hint(&e)))?;
 
     let (sent, recv) = reveal_ranges(prover.transcript())?;
 
@@ -349,7 +355,7 @@ fn reveal_ranges(transcript: &Transcript) -> Result<(RangeSet<usize>, RangeSet<u
 
     let request = Requests::new(Bytes::copy_from_slice(transcript.sent()))
         .next()
-        .ok_or("no request in transcript")??;
+        .context("no request in transcript")??;
 
     let mut sent = RangeSet::from(0..sent_len);
     for header in request.headers_with_name("user-agent") {
@@ -416,8 +422,8 @@ fn verify_presentation(presentation: Presentation) -> Result<Verified, Error> {
         ..
     } = presentation.verify(&CryptoProvider::default())?;
 
-    let server_name = server_name.ok_or("server name not revealed")?.to_string();
-    let mut partial_transcript = transcript.ok_or("transcript not revealed")?;
+    let server_name = server_name.context("server name not revealed")?.to_string();
+    let mut partial_transcript = transcript.context("transcript not revealed")?;
     partial_transcript.set_unauthed(b'X');
 
     Ok(Verified {

@@ -21,6 +21,8 @@
 
 use std::collections::{HashMap, HashSet};
 
+use anyhow::{anyhow, Context as _};
+
 use super::{check, iroh, keyring, keysignparty, Error, Invalid, ProfileAttestation};
 use crate::{
     db::Db,
@@ -65,7 +67,7 @@ pub async fn create(db: &dyn Db, keys: &Keys, notary_key: &str) -> Result<Export
                 record: db
                     .get(&checked.file)
                     .await?
-                    .ok_or_else(|| format!("{} was removed while exporting", checked.file))?,
+                    .with_context(|| format!("{} was removed while exporting", checked.file))?,
                 file: checked.file,
             }),
             Err(error) => skipped.push(Invalid {
@@ -144,7 +146,9 @@ pub async fn merge(
     let keyring = keyring(db).await?;
     let signed = message::verify(markdown, &keyring)?;
     if !is_export(&signed.msg) {
-        return Err("not an export: the signed message is not an attestation bundle".into());
+        return Err(anyhow!(
+            "not an export: the signed message is not an attestation bundle"
+        ));
     }
 
     let local: Vec<ProfileAttestation> = check(db, None, notary_key)
@@ -304,7 +308,7 @@ fn check_safe_file_name(file: &str) -> Result<(), Error> {
         || file.chars().any(char::is_control)
         || !file.ends_with(".md")
     {
-        return Err(format!("unsafe file name `{file}`").into());
+        return Err(anyhow!("unsafe file name `{file}`"));
     }
 
     Ok(())
@@ -326,16 +330,16 @@ fn bundle(date: &str, exported: &[Exported]) -> String {
 fn parse(msg: &str) -> Result<Vec<Exported>, Error> {
     let mut lines = msg.split('\n');
     if lines.next() != Some(HEADER) {
-        return Err("not an export: missing header".into());
+        return Err(anyhow!("not an export: missing header"));
     }
     lines
         .next()
         .and_then(|line| line.strip_prefix("date:"))
-        .ok_or("invalid export: expected `date:`")?;
+        .context("invalid export: expected `date:`")?;
     let count: usize = lines
         .next()
         .and_then(|line| line.strip_prefix("count:"))
-        .ok_or("invalid export: expected `count:`")?
+        .context("invalid export: expected `count:`")?
         .parse()?;
 
     let mut exported = Vec::new();
@@ -347,18 +351,17 @@ fn parse(msg: &str) -> Result<Vec<Exported>, Error> {
         } else {
             let (_, encoded) = current
                 .as_mut()
-                .ok_or("invalid export: data before the first attestation")?;
+                .context("invalid export: data before the first attestation")?;
             encoded.push_str(line);
         }
     }
     exported.extend(current.map(decode).transpose()?);
 
     if exported.len() != count {
-        return Err(format!(
+        return Err(anyhow!(
             "invalid export: expected {count} attestations, found {}",
             exported.len()
-        )
-        .into());
+        ));
     }
 
     Ok(exported)
@@ -368,9 +371,9 @@ fn decode((file, encoded): (String, String)) -> Result<Exported, Error> {
     let record = String::from_utf8(
         bs58::decode(&encoded)
             .into_vec()
-            .map_err(|e| format!("invalid base58 in attestation {file}: {e}"))?,
+            .map_err(|e| anyhow!("invalid base58 in attestation {file}: {e}"))?,
     )
-    .map_err(|_| format!("attestation {file} is not valid UTF-8"))?;
+    .map_err(|_| anyhow!("attestation {file} is not valid UTF-8"))?;
 
     Ok(Exported { file, record })
 }

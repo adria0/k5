@@ -2,16 +2,23 @@
 //
 // A connection starts with a hello on its first bidirectional stream: each
 // side sends its self attestation and its iroh attestation (the dialer first,
-// then the listener if it accepts the dialer). Every later request is a new
-// bidirectional stream. A payload is one kind byte followed by UTF-8 text;
-// the sender finishes the stream after it, so the end of the stream delimits
-// it, and the receiver reads it with a size limit.
+// then the listener if it accepts the dialer). A first contact by ticket
+// sends a pairing hello instead ([`PAIR`]), which the listener also accepts
+// from a k5 not on its web of trust while its pairing window is open. Every
+// later request is a new bidirectional stream. A payload is one kind byte
+// followed by UTF-8 text; the sender finishes the stream after it, so the end
+// of the stream delimits it, and the receiver reads it with a size limit.
+
+use anyhow::{anyhow, Context as _};
+use k5lib::Error;
 
 /// ALPN of the k5 protocol.
 pub const ALPN: &[u8] = b"k5/1";
 
 /// Hello: the self attestation and the iroh attestation of the sender.
 pub const HELLO: u8 = b'H';
+/// A hello for a first contact by ticket (pairing), as [`HELLO`].
+pub const PAIR: u8 = b'P';
 /// A signcrypted message (armored) for the receiver.
 pub const MESSAGE: u8 = b'M';
 /// A request for the receiver's signed export (`attest export`).
@@ -42,9 +49,9 @@ pub fn encode(kind: u8, text: &str) -> Vec<u8> {
 }
 
 /// Splits a payload into its kind and text.
-pub fn decode(payload: &[u8]) -> Result<(u8, String), String> {
-    let (&kind, text) = payload.split_first().ok_or("empty payload")?;
-    let text = String::from_utf8(text.to_vec()).map_err(|_| "payload is not UTF-8")?;
+pub fn decode(payload: &[u8]) -> Result<(u8, String), Error> {
+    let (&kind, text) = payload.split_first().context("empty payload")?;
+    let text = String::from_utf8(text.to_vec()).context("payload is not UTF-8")?;
 
     Ok((kind, text))
 }
@@ -56,17 +63,17 @@ pub fn hello(me_record: &str, iroh_record: &str) -> String {
 
 /// Splits the text of a hello into the self attestation and the iroh
 /// attestation.
-pub fn parse_hello(text: &str) -> Result<(&str, &str), String> {
+pub fn parse_hello(text: &str) -> Result<(&str, &str), Error> {
     text.split_once(RECORD_SEPARATOR)
-        .ok_or_else(|| "invalid hello: expected two records".to_string())
+        .context("invalid hello: expected two records")
 }
 
 /// The text form of a ticket: how to reach an endpoint, for a first contact
 /// with a k5 whose iroh attestation is not known yet.
-pub fn ticket(addr: &iroh::EndpointAddr) -> Result<String, String> {
+pub fn ticket(addr: &iroh::EndpointAddr) -> Result<String, Error> {
     use base64::Engine;
 
-    let json = serde_json::to_vec(addr).map_err(|e| e.to_string())?;
+    let json = serde_json::to_vec(addr)?;
     Ok(format!(
         "{TICKET_PREFIX}{}",
         base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(json)
@@ -74,17 +81,17 @@ pub fn ticket(addr: &iroh::EndpointAddr) -> Result<String, String> {
 }
 
 /// Parses the text form of a ticket.
-pub fn parse_ticket(ticket: &str) -> Result<iroh::EndpointAddr, String> {
+pub fn parse_ticket(ticket: &str) -> Result<iroh::EndpointAddr, Error> {
     use base64::Engine;
 
     let encoded = ticket
         .trim()
         .strip_prefix(TICKET_PREFIX)
-        .ok_or_else(|| format!("invalid ticket: expected `{TICKET_PREFIX}...`"))?;
+        .ok_or_else(|| anyhow!("invalid ticket: expected `{TICKET_PREFIX}...`"))?;
     let json = base64::engine::general_purpose::URL_SAFE_NO_PAD
         .decode(encoded)
-        .map_err(|e| format!("invalid ticket: {e}"))?;
-    serde_json::from_slice(&json).map_err(|e| format!("invalid ticket: {e}"))
+        .context("invalid ticket")?;
+    serde_json::from_slice(&json).context("invalid ticket")
 }
 
 #[cfg(test)]

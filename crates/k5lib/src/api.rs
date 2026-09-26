@@ -15,10 +15,13 @@ use std::{
     path::Path,
 };
 
+use anyhow::{anyhow, Context as _};
+
 use crate::{
     attestations::{self, export, iroh, keysignparty, me, tlsnotary},
     db::{Db, FsDb},
     graph,
+    k5id::K5Id,
     key::{self, Keys},
     message, signcrypt,
 };
@@ -203,7 +206,7 @@ impl K5 {
     /// The iroh endpoint `k5` can be reached at, from its iroh attestation,
     /// or `None` if there is none.
     pub async fn iroh_endpoint(&self, k5: &str) -> Result<Option<Iroh>, Error> {
-        iroh::lookup(self.db(), k5).await
+        iroh::lookup(self.db(), &K5Id::parse(k5)?).await
     }
 
     /// Notarizes an HTTPS URL with TLSNotary, writing the presentation to
@@ -228,7 +231,7 @@ impl K5 {
     /// the regex `pattern`.
     pub async fn search(&self, pattern: &str) -> Result<Listing, Error> {
         let pattern =
-            regex::Regex::new(pattern).map_err(|e| format!("invalid regex `{pattern}`: {e}"))?;
+            regex::Regex::new(pattern).map_err(|e| anyhow!("invalid regex `{pattern}`: {e}"))?;
 
         let mut listing = self.list().await?;
         listing
@@ -240,7 +243,15 @@ impl K5 {
 
     /// The valid attestations of `k5`.
     pub async fn attested_by(&self, k5: &str) -> Result<Listing, Error> {
-        attestations::attested_by(self.db(), k5, &self.notary_key).await
+        attestations::attested_by(self.db(), &K5Id::parse(k5)?, &self.notary_key).await
+    }
+
+    /// The k5s on the web of trust: reachable from the local one through
+    /// the keysigns in the database, the local one included. Only keysign
+    /// records are verified, so this is much cheaper than [`K5::list`].
+    pub async fn trusted(&self) -> Result<HashSet<String>, Error> {
+        let keysigns = attestations::keysigns(self.db(), &self.notary_key).await?;
+        Ok(self.web_of_trust(&keysigns.attestations))
     }
 
     /// The k5s reachable from the local one through the keysigns among
@@ -251,8 +262,9 @@ impl K5 {
 
     /// The shortest chain of keysigns from the local k5 to `to` among
     /// `attestations`: the k5s from the local one to `to`, both included, or
-    /// `None` if `to` is not on the web of trust.
+    /// `None` if `to` is not on the web of trust, or not a k5.
     pub fn trust_path(&self, attestations: &[ProfileAttestation], to: &str) -> Option<Vec<String>> {
+        let to = K5Id::parse(to).ok()?;
         let mut edges: HashMap<&str, Vec<&str>> = HashMap::new();
         for attestation in attestations.iter().filter(|a| export::is_keysign(a)) {
             if let Some(signer) = &attestation.signer {
@@ -264,12 +276,11 @@ impl K5 {
         }
 
         // Breadth first from the local k5, remembering who reached whom.
-        let me = self.k5().to_ascii_lowercase();
-        let to = to.to_ascii_lowercase();
+        let me = self.k5();
         let mut previous: HashMap<&str, &str> = HashMap::new();
         let mut queue = VecDeque::from([me.as_str()]);
         while let Some(k5) = queue.pop_front() {
-            if k5 == to {
+            if k5 == to.as_str() {
                 let mut path = vec![k5.to_string()];
                 let mut k5 = k5;
                 while let Some(signer) = previous.get(k5) {
@@ -348,33 +359,47 @@ impl K5 {
     /// Signs `msg` and encrypts it to the encryption subkey of the self
     /// attestation of `to` (with or without the `k5:` prefix).
     pub async fn signcrypt(&self, to: &str, msg: &str) -> Result<Signcrypted, Error> {
-        let to_key = signcrypt::recipient_encryption_key(self.db(), to).await?;
-        let to = signcrypt::recipient_k5(to);
+        let to = K5Id::parse(to)?;
+        let to_key = signcrypt::recipient_encryption_key(self.db(), &to).await?;
         let armored = signcrypt::seal(&self.keys, &to, &to_key, msg)?;
 
-        Ok(Signcrypted { to, armored })
+        Ok(Signcrypted {
+            to: to.into(),
+            armored,
+        })
     }
 
     /// Accepts a signcrypted message delivered by `from`: it must be
     /// addressed to the local k5 and signed by `from`, whose self
     /// attestation must be in the database. Stores it, still encrypted, in
-    /// the inbox.
+    /// the inbox, once: a message delivered again is not stored again.
     pub async fn receive(&self, from: &str, armored: &str) -> Result<InboxMessage, Error> {
-        let from = signcrypt::recipient_k5(from);
+        let from = K5Id::parse(from)?;
         let sender = me::lookup(self.db(), &from)
             .await?
-            .ok_or_else(|| format!("no self attestation of the sender k5:{from}"))?;
+            .with_context(|| format!("no self attestation of the sender k5:{from}"))?;
         let opened = signcrypt::open(
             &self.keys,
             armored,
             &message::Keyring::from([(sender.k5, sender.public)]),
         )?;
-        if opened.from != from {
-            return Err(format!("message from k5:{} delivered by k5:{from}", opened.from).into());
+        if opened.from != from.as_str() {
+            return Err(anyhow!(
+                "message from k5:{} delivered by k5:{from}",
+                opened.from
+            ));
         }
 
-        let name = message_name(&from)?;
-        self.inbox.put(&name, armored).await?;
+        let suffix = message_suffix(&from, armored);
+        let existing = self.inbox.names().await?;
+        let name = match existing.into_iter().find(|name| name.ends_with(&suffix)) {
+            Some(name) => name,
+            None => {
+                let name = message_name(&suffix)?;
+                self.inbox.put(&name, armored).await?;
+                name
+            }
+        };
 
         Ok(InboxMessage {
             name,
@@ -385,9 +410,10 @@ impl K5 {
     /// Keeps a copy of `msg`, sent to `to`: signcrypted to the local key, so
     /// it is stored encrypted like received messages.
     pub async fn record_sent(&self, to: &str, msg: &str) -> Result<(), Error> {
-        let to = signcrypt::recipient_k5(to);
+        let to = K5Id::parse(to)?;
         let armored = signcrypt::seal(&self.keys, &to, &self.keys.encryption_subkey()?, msg)?;
-        self.sent.put(&message_name(&to)?, &armored).await
+        let name = message_name(&message_suffix(&to, &armored))?;
+        self.sent.put(&name, &armored).await
     }
 
     /// The conversations with other k5s: the messages received and sent,
@@ -498,25 +524,31 @@ impl K5 {
                 &keyring,
             )?))
         } else {
-            Err(
+            Err(anyhow!(
                 "neither a signed message, a signcrypted message nor an attestation record \
                  (`# info`)"
-                    .into(),
-            )
+            ))
         }
     }
 }
 
-/// Name of a stored message with `k5`: `<ms since epoch>-<random>-<k5>.asc`,
-/// so names sort by time and never collide.
-fn message_name(k5: &str) -> Result<String, Error> {
+/// Name of a stored message: `<ms since epoch>-<hash>-<k5>.asc`, with the
+/// [`message_suffix`] of the message, so names sort by time and a message is
+/// found again by its content.
+fn message_name(suffix: &str) -> Result<String, Error> {
     let millis = std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)?
         .as_millis();
-    Ok(format!(
-        "{millis:013}-{:08x}-{k5}.asc",
-        rand::random::<u32>()
-    ))
+    Ok(format!("{millis:013}{suffix}"))
+}
+
+/// The end of the name of a stored message with `k5`, which identifies it:
+/// `-<hash>-<k5>.asc`, with the start of the SHA-256 of the armored message.
+fn message_suffix(k5: &K5Id, armored: &str) -> String {
+    use sha2::{Digest, Sha256};
+
+    let hash = Sha256::digest(armored.as_bytes());
+    format!("-{}-{k5}.asc", hex::encode(&hash[..16]))
 }
 
 /// When a stored message was received or sent, from its name.
@@ -586,6 +618,13 @@ mod tests {
 
         let received = bob.receive(&alice.k5(), &sealed.armored).await.unwrap();
         assert!(received.name.ends_with(&format!("-{}.asc", alice.k5())));
+        // Delivered again: stored once.
+        let again = bob.receive(&alice.k5(), &sealed.armored).await.unwrap();
+        assert_eq!(again.name, received.name);
+        // An invalid sender or recipient k5 is rejected.
+        assert!(bob.receive("k5:nope", &sealed.armored).await.is_err());
+        assert!(alice.signcrypt("../x", "hi").await.is_err());
+        assert!(alice.record_sent("../x", "hi").await.is_err());
 
         let inbox = bob.read_inbox().await.unwrap();
         assert_eq!(inbox.len(), 1);
@@ -622,6 +661,37 @@ mod tests {
 
         std::fs::remove_dir_all(alice_dir).unwrap();
         std::fs::remove_dir_all(bob_dir).unwrap();
+    }
+
+    #[tokio::test]
+    async fn test_trusted() {
+        let (alice, dir) = temp_k5("trusted");
+        alice.ensure_self_attestation().await.unwrap();
+        let [bob, carol] = [test_keys(), test_keys()];
+        let bob_me = me::create(&bob, false).unwrap();
+        alice.db().put(&me::name(&bob.k5()), &bob_me).await.unwrap();
+
+        alice.keysign(&bob.k5(), "Bob").await.unwrap();
+        // Bob's keysign of carol, under another name, as a merge may store it.
+        let (_, record) = keysignparty::create(&bob, &carol.k5(), "Carol", false).unwrap();
+        let name = format!("{}-merged.md", carol.k5());
+        alice.db().put(&name, &record).await.unwrap();
+        // Other records are not verified.
+        let broken = format!("{}-broken.md", "d".repeat(64));
+        alice
+            .db()
+            .put(&broken, "# info\n\n- Type: tlsn\n")
+            .await
+            .unwrap();
+
+        let trusted = alice.trusted().await.unwrap();
+        assert_eq!(trusted, HashSet::from([alice.k5(), bob.k5(), carol.k5()]));
+        // The same as from the full listing.
+        let listing = alice.list().await.unwrap();
+        assert_eq!(listing.invalid.len(), 1);
+        assert_eq!(alice.web_of_trust(&listing.attestations), trusted);
+
+        std::fs::remove_dir_all(dir).unwrap();
     }
 
     #[test]

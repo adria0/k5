@@ -20,6 +20,7 @@
 // signature, made by the primary key and checked by `verify_bindings`,
 // already proves it belongs to the k5 of the primary key.
 
+use anyhow::{anyhow, Context as _};
 use pgp::{
     composed::{Deserializable, SignedPublicKey},
     types::KeyDetails,
@@ -114,9 +115,9 @@ pub async fn lookup(db: &dyn Db, k5: &str) -> Result<Option<Me>, Error> {
         return Ok(None);
     };
 
-    let me = verify(&record).map_err(|e| format!("invalid self attestation {name}: {e}"))?;
+    let me = verify(&record).map_err(|e| anyhow!("invalid self attestation {name}: {e}"))?;
     if me.k5 != k5 {
-        return Err(format!("{name} is the self attestation of k5:{}", me.k5).into());
+        return Err(anyhow!("{name} is the self attestation of k5:{}", me.k5));
     }
 
     Ok(Some(me))
@@ -151,12 +152,12 @@ pub fn create(keys: &Keys, fake: bool) -> Result<String, Error> {
 pub fn verify(record: &str) -> Result<Me, Error> {
     let fake = super::record_fake(record)?.unwrap_or(false);
     let date = super::info_field(record, "- Created:")
-        .ok_or("self attestation has no `- Created:` field")?
+        .context("self attestation has no `- Created:` field")?
         .to_string();
 
     let (_, public_key) = record
         .split_once("\n# public_key\n")
-        .ok_or("self attestation has no `# public_key` section")?;
+        .context("self attestation has no `# public_key` section")?;
     let (public, _) = SignedPublicKey::from_string(public_key)?;
     public.verify_bindings()?;
 

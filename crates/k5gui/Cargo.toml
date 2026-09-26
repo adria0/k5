@@ -13,6 +13,7 @@ name = "k5gui"
 path = "src/main.rs"
 
 [dependencies]
+anyhow = { workspace = true }
 k5lib = { path = "../k5lib" }
 k5net = { path = "../k5net" }
 

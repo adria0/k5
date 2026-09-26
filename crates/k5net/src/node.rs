@@ -6,9 +6,21 @@
 // request and closes. Incoming requests are answered by the router's
 // protocol handler: messages go to the inbox, export requests are answered
 // with a signed export. What happens is reported through the events callback.
+//
+// A first contact by ticket is a pairing: issuing a ticket opens a pairing
+// window, during which a k5 not on the web of trust may connect with it. Both
+// sides store each other's records and get a check phrase (see `peer`), to
+// compare before keysigning each other; until then, the new peer's requests
+// are refused.
 
-use std::{path::Path, sync::Arc, time::Duration};
+use std::{
+    collections::HashMap,
+    path::Path,
+    sync::{Arc, Mutex},
+    time::{Duration, Instant},
+};
 
+use anyhow::{anyhow, bail, Context as _};
 use iroh::{
     address_lookup::MemoryLookup,
     endpoint::{presets, Connection, RecvStream, SendStream},
@@ -17,6 +29,7 @@ use iroh::{
 };
 use k5lib::{
     api::{MergeReport, K5},
+    k5id::K5Id,
     key, Error,
 };
 
@@ -24,7 +37,7 @@ use crate::{
     peer::{self, Peer},
     proto::{
         self, ALPN, EXPORT, EXPORT_LIMIT, EXPORT_REQUEST, HELLO, HELLO_LIMIT, MESSAGE,
-        MESSAGE_LIMIT, OK, REFUSED,
+        MESSAGE_LIMIT, OK, PAIR, REFUSED,
     },
 };
 
@@ -34,9 +47,17 @@ const CONFIG_SECTION: &str = "iroh";
 /// How long a refused peer is given to read the refusal.
 const REFUSAL_GRACE: Duration = Duration::from_secs(10);
 
+/// How many messages a peer may deliver per [`MESSAGE_WINDOW`]; more are
+/// refused, so a trusted peer cannot fill the inbox.
+const MESSAGE_RATE: u32 = 30;
+const MESSAGE_WINDOW: Duration = Duration::from_secs(60);
+
 /// How long a ticket waits for a home relay, so it can be used from another
 /// network.
 const TICKET_RELAY_WAIT: Duration = Duration::from_secs(10);
+
+/// How long issuing a ticket lets k5s not on the web of trust pair.
+pub const PAIRING_WINDOW: Duration = Duration::from_secs(10 * 60);
 
 /// How the endpoint finds and reaches other endpoints.
 pub enum Network {
@@ -56,10 +77,28 @@ pub enum Event {
     Received { from: String, msg: String },
     /// A peer was sent the local signed export.
     Served { k5: String },
+    /// A k5 connected with the ticket (a pairing): its records were stored.
+    /// `phrase` is the check phrase to compare with it before keysigning it;
+    /// `trusted` tells whether it already is on the web of trust.
+    Paired {
+        k5: String,
+        trusted: bool,
+        phrase: String,
+    },
     /// A connection was refused: unknown or untrusted peer, invalid hello.
     Refused { endpoint: String, reason: String },
     /// A connection failed while serving it.
     Error(String),
+}
+
+/// A k5 met by ticket, from [`Node::connect_ticket`].
+#[derive(Debug)]
+pub struct Contact {
+    pub k5: String,
+    /// On the web of trust already.
+    pub trusted: bool,
+    /// The check phrase, the same on both sides.
+    pub phrase: String,
 }
 
 /// A running node, stopped by [`Node::shutdown`].
@@ -68,6 +107,28 @@ pub struct Node {
     k5: Arc<K5>,
     /// Uses relays: tickets wait for the home relay.
     relays: bool,
+    pairing: Arc<Pairing>,
+}
+
+/// Until when k5s not on the web of trust may pair.
+#[derive(Default)]
+struct Pairing(Mutex<Option<Instant>>);
+
+impl Pairing {
+    fn open(&self, duration: Duration) {
+        *self.0.lock().unwrap_or_else(|e| e.into_inner()) = Some(Instant::now() + duration);
+    }
+
+    fn close(&self) {
+        *self.0.lock().unwrap_or_else(|e| e.into_inner()) = None;
+    }
+
+    fn is_open(&self) -> bool {
+        self.0
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .is_some_and(|until| Instant::now() < until)
+    }
 }
 
 impl Node {
@@ -85,15 +146,13 @@ impl Node {
             Network::Local(lookup) => Endpoint::builder(presets::Minimal)
                 .relay_mode(RelayMode::Disabled)
                 .address_lookup(lookup.clone())
-                .bind_addr("127.0.0.1:0")
-                .map_err(|e| e.to_string())?,
+                .bind_addr("127.0.0.1:0")?,
         };
         let endpoint = builder
             .secret_key(secret)
             .alpns(vec![ALPN.to_vec()])
             .bind()
-            .await
-            .map_err(|e| e.to_string())?;
+            .await?;
 
         k5.ensure_self_attestation().await?;
         k5.ensure_iroh_attestation(&peer::endpoint_hex(&endpoint.id()))
@@ -107,9 +166,13 @@ impl Node {
             lookup.add_endpoint_info(addr);
         }
 
+        let pairing = Arc::new(Pairing::default());
         let handler = Handler {
             k5: k5.clone(),
             events: Arc::new(events),
+            rates: Arc::default(),
+            pairing: pairing.clone(),
+            local: endpoint.id(),
         };
         let router = Router::builder(endpoint).accept(ALPN, handler).spawn();
 
@@ -117,6 +180,7 @@ impl Node {
             router,
             k5,
             relays: matches!(network, Network::N0),
+            pairing,
         })
     }
 
@@ -126,25 +190,49 @@ impl Node {
     }
 
     /// A ticket to reach this node, for a first contact with a k5 that does
-    /// not have its iroh attestation yet. With relays, first waits (a
-    /// while) for the home relay, so the ticket also works from other
-    /// networks, not only with the direct addresses.
+    /// not have its iroh attestation yet. Opens the pairing window for
+    /// [`PAIRING_WINDOW`]: k5s not on the web of trust may connect with it.
+    /// With relays, first waits (a while) for the home relay, so the ticket
+    /// also works from other networks, not only with the direct addresses.
     pub async fn ticket(&self) -> Result<String, Error> {
+        self.pairing.open(PAIRING_WINDOW);
         let endpoint = self.router.endpoint();
         if self.relays {
             let _ = tokio::time::timeout(TICKET_RELAY_WAIT, endpoint.online()).await;
         }
 
-        Ok(proto::ticket(&endpoint.addr())?)
+        proto::ticket(&endpoint.addr())
     }
 
-    /// Connects to the endpoint of a ticket and exchanges hellos, so each
-    /// side stores the other's records. Returns the k5 of the peer.
-    pub async fn connect_ticket(&self, ticket: &str) -> Result<String, Error> {
-        let session = self.open(proto::parse_ticket(ticket)?, None).await?;
-        session.close();
+    /// Closes the pairing window: only k5s on the web of trust are accepted.
+    pub fn stop_pairing(&self) {
+        self.pairing.close();
+    }
 
-        Ok(session.peer.k5)
+    /// Pairs with the k5 of a ticket, which may not be on the web of trust
+    /// yet: exchanges hellos, so each side stores the other's records, and
+    /// returns who it is, with the check phrase to compare before keysigning
+    /// it.
+    pub async fn connect_ticket(&self, ticket: &str) -> Result<Contact, Error> {
+        let session = self.open(proto::parse_ticket(ticket)?, None, true).await?;
+        session.close();
+        let phrase = peer::check_phrase(
+            (&self.k5.k5(), &self.router.endpoint().id()),
+            (&session.peer.k5, &session.conn.remote_id()),
+        );
+
+        Ok(Contact {
+            k5: session.peer.k5.clone(),
+            trusted: session.trusted,
+            phrase,
+        })
+    }
+
+    /// Whether `k5`, on the web of trust, answers: connects to it and says
+    /// hello.
+    pub async fn ping(&self, k5: &str) -> Result<(), Error> {
+        self.dial(k5).await?.close();
+        Ok(())
     }
 
     /// Signs `msg`, encrypts it to `to` and delivers it to `to`, which must
@@ -163,9 +251,9 @@ impl Node {
                 .k5
                 .record_sent(&session.peer.k5, msg)
                 .await
-                .map_err(|e| format!("delivered, but the sent copy was not saved: {e}").into()),
-            (REFUSED, reason) => Err(format!("k5:{to} refused the message: {reason}").into()),
-            (kind, _) => Err(unexpected(kind).into()),
+                .context("delivered, but the sent copy was not saved"),
+            (REFUSED, reason) => Err(anyhow!("k5:{to} refused the message: {reason}")),
+            (kind, _) => bail!(unexpected(kind)),
         }
     }
 
@@ -178,67 +266,73 @@ impl Node {
 
         match result? {
             (EXPORT, markdown) => self.k5.merge(&markdown, false).await,
-            (REFUSED, reason) => Err(format!("k5:{peer} refused the sync: {reason}").into()),
-            (kind, _) => Err(unexpected(kind).into()),
+            (REFUSED, reason) => Err(anyhow!("k5:{peer} refused the sync: {reason}")),
+            (kind, _) => bail!(unexpected(kind)),
         }
     }
 
     /// Stops accepting connections and closes the endpoint.
-    pub async fn shutdown(self) -> Result<(), Error> {
-        self.router.shutdown().await.map_err(|e| e.to_string())?;
+    pub async fn shutdown(&self) -> Result<(), Error> {
+        self.router.shutdown().await?;
         Ok(())
     }
 
     /// Connects to the k5 `k5`, by the endpoint of its iroh attestation.
     async fn dial(&self, k5: &str) -> Result<Session, Error> {
-        let k5 = k5
-            .trim()
-            .strip_prefix("k5:")
-            .unwrap_or(k5.trim())
-            .to_ascii_lowercase();
-        let iroh = self.k5.iroh_endpoint(&k5).await?.ok_or_else(|| {
+        let k5 = K5Id::parse(k5)?;
+        let iroh = self.k5.iroh_endpoint(&k5).await?.with_context(|| {
             format!("k5:{k5} has no iroh attestation: connect to it with a ticket first")
         })?;
         let id = peer::parse_endpoint(&iroh.endpoint)?;
 
-        self.open(EndpointAddr::new(id), Some(&k5)).await
+        self.open(EndpointAddr::new(id), Some(k5.as_str()), false)
+            .await
     }
 
     /// Connects to `addr` and exchanges hellos. With `expected`, the peer must
-    /// prove to be that k5.
-    async fn open(&self, addr: EndpointAddr, expected: Option<&str>) -> Result<Session, Error> {
+    /// prove to be that k5. With `pair`, a pairing hello: the peer may not be
+    /// on the web of trust.
+    async fn open(
+        &self,
+        addr: EndpointAddr,
+        expected: Option<&str>,
+        pair: bool,
+    ) -> Result<Session, Error> {
         let conn = self
             .router
             .endpoint()
             .connect(addr, ALPN)
             .await
-            .map_err(|e| format!("cannot connect: {e}"))?;
-        let session = |peer| Session {
+            .context("cannot connect")?;
+        let session = |(peer, trusted)| Session {
             conn: conn.clone(),
             peer,
+            trusted,
         };
 
         let hello = peer::local_hello(&self.k5).await?;
-        let (kind, text) = request(&conn, HELLO, &hello, HELLO_LIMIT).await?;
+        let kind = if pair { PAIR } else { HELLO };
+        let (kind, text) = request(&conn, kind, &hello, HELLO_LIMIT).await?;
         let result = async {
             match kind {
                 HELLO => {}
-                REFUSED => return Err(format!("refused by the peer: {text}")),
-                kind => return Err(unexpected(kind)),
+                REFUSED => bail!("refused by the peer: {text}"),
+                kind => bail!(unexpected(kind)),
             }
             let (me_record, iroh_record) = proto::parse_hello(&text)?;
             let peer = peer::verify(me_record, iroh_record, &conn.remote_id())?;
             if let Some(expected) = expected {
                 if peer.k5 != expected {
-                    return Err(format!("the endpoint of k5:{expected} is k5:{}", peer.k5));
+                    bail!("the endpoint of k5:{expected} is k5:{}", peer.k5);
                 }
             }
-            if !peer::is_trusted(&self.k5, &peer.k5).await? {
-                return Err(format!("k5:{} is not on your web of trust", peer.k5));
+            let trusted = peer::is_trusted(&self.k5, &peer.k5).await?;
+            if !trusted && !pair {
+                bail!("k5:{} is not on your web of trust", peer.k5);
             }
             peer::store(&self.k5, &peer).await?;
 
-            Ok(peer)
+            Ok((peer, trusted))
         }
         .await;
 
@@ -246,21 +340,22 @@ impl Node {
             Ok(peer) => Ok(session(peer)),
             Err(e) => {
                 conn.close(1u32.into(), b"refused");
-                Err(e.into())
+                Err(e)
             }
         }
     }
 }
 
-/// An open connection to a verified, trusted peer.
+/// An open connection to a verified peer: trusted, unless paired.
 struct Session {
     conn: Connection,
     peer: Peer,
+    trusted: bool,
 }
 
 impl Session {
     async fn request(&self, kind: u8, text: &str, limit: usize) -> Result<(u8, String), Error> {
-        Ok(request(&self.conn, kind, text, limit).await?)
+        request(&self.conn, kind, text, limit).await
     }
 
     fn close(&self) {
@@ -274,23 +369,22 @@ async fn request(
     kind: u8,
     text: &str,
     limit: usize,
-) -> Result<(u8, String), String> {
-    let (mut send, mut recv) = conn.open_bi().await.map_err(|e| e.to_string())?;
+) -> Result<(u8, String), Error> {
+    let (mut send, mut recv) = conn.open_bi().await?;
     reply(&mut send, kind, text).await?;
-    let payload = recv.read_to_end(limit).await.map_err(|e| e.to_string())?;
-    proto::decode(&payload)
+    read(&mut recv, limit).await
 }
 
 /// Writes a payload and finishes the stream.
-async fn reply(send: &mut SendStream, kind: u8, text: &str) -> Result<(), String> {
-    send.write_all(&proto::encode(kind, text))
-        .await
-        .map_err(|e| e.to_string())?;
-    send.finish().map_err(|e| e.to_string())
+async fn reply(send: &mut SendStream, kind: u8, text: &str) -> Result<(), Error> {
+    send.write_all(&proto::encode(kind, text)).await?;
+    send.finish()?;
+
+    Ok(())
 }
 
-async fn read(recv: &mut RecvStream, limit: usize) -> Result<(u8, String), String> {
-    let payload = recv.read_to_end(limit).await.map_err(|e| e.to_string())?;
+async fn read(recv: &mut RecvStream, limit: usize) -> Result<(u8, String), Error> {
+    let payload = recv.read_to_end(limit).await?;
     proto::decode(&payload)
 }
 
@@ -303,6 +397,28 @@ fn unexpected(kind: u8) -> String {
 struct Handler {
     k5: Arc<K5>,
     events: Arc<dyn Fn(Event) + Send + Sync>,
+    rates: Arc<Rates>,
+    pairing: Arc<Pairing>,
+    /// The local endpoint id, for check phrases.
+    local: iroh::EndpointId,
+}
+
+/// Messages delivered by each k5 in its current window: when the window
+/// started, and how many.
+#[derive(Default)]
+struct Rates(Mutex<HashMap<String, (Instant, u32)>>);
+
+impl Rates {
+    /// Counts a message delivered by `k5` at `now`, returning whether it is
+    /// within [`MESSAGE_RATE`].
+    fn allow(&self, k5: &str, now: Instant) -> bool {
+        let mut rates = self.0.lock().unwrap_or_else(|e| e.into_inner());
+        rates.retain(|_, (start, _)| now.saturating_duration_since(*start) < MESSAGE_WINDOW);
+        let (_, count) = rates.entry(k5.to_string()).or_insert((now, 0));
+        *count += 1;
+
+        *count <= MESSAGE_RATE
+    }
 }
 
 impl std::fmt::Debug for Handler {
@@ -315,7 +431,7 @@ impl ProtocolHandler for Handler {
     async fn accept(&self, conn: Connection) -> Result<(), AcceptError> {
         if let Err(e) = self.serve(&conn).await {
             (self.events)(Event::Error(format!(
-                "connection from {}: {e}",
+                "connection from {}: {e:#}",
                 peer::endpoint_hex(&conn.remote_id())
             )));
             conn.close(2u32.into(), b"error");
@@ -326,22 +442,26 @@ impl ProtocolHandler for Handler {
 }
 
 impl Handler {
-    async fn serve(&self, conn: &Connection) -> Result<(), String> {
+    async fn serve(&self, conn: &Connection) -> Result<(), Error> {
         let remote = conn.remote_id();
-        let (mut send, mut recv) = conn.accept_bi().await.map_err(|e| e.to_string())?;
+        let (mut send, mut recv) = conn.accept_bi().await?;
         let (kind, text) = read(&mut recv, HELLO_LIMIT).await?;
-        let verified = if kind == HELLO {
+        let pairing = kind == PAIR;
+        let verified = if kind == HELLO || pairing {
             proto::parse_hello(&text)
                 .and_then(|(me_record, iroh_record)| peer::verify(me_record, iroh_record, &remote))
         } else {
-            Err(format!("expected a hello, got `{}`", kind as char))
+            Err(anyhow!("expected a hello, got `{}`", kind as char))
+        };
+        let trusted = match &verified {
+            Ok(peer) => peer::is_trusted(&self.k5, &peer.k5).await?,
+            Err(_) => false,
         };
         let refusal = match &verified {
-            Err(e) => Some(e.clone()),
-            Ok(peer) if !peer::is_trusted(&self.k5, &peer.k5).await? => {
-                Some(format!("k5:{} is not on the web of trust", peer.k5))
-            }
-            Ok(_) => None,
+            Err(e) => Some(format!("{e:#}")),
+            // A pairing while the window is open: the peer may keysign later.
+            Ok(_) if trusted || (pairing && self.pairing.is_open()) => None,
+            Ok(peer) => Some(format!("k5:{} is not on the web of trust", peer.k5)),
         };
         if let Some(reason) = refusal {
             reply(&mut send, REFUSED, &reason).await?;
@@ -357,15 +477,31 @@ impl Handler {
 
         peer::store(&self.k5, &peer).await?;
         reply(&mut send, HELLO, &peer::local_hello(&self.k5).await?).await?;
+        if pairing {
+            let phrase = peer::check_phrase((&self.k5.k5(), &self.local), (&peer.k5, &remote));
+            (self.events)(Event::Paired {
+                k5: peer.k5.clone(),
+                trusted,
+                phrase,
+            });
+        }
 
         // Requests, one per stream, until the peer closes the connection.
         while let Ok((mut send, mut recv)) = conn.accept_bi().await {
             let (kind, text) = read(&mut recv, MESSAGE_LIMIT).await?;
             match kind {
+                // Paired, but not keysigned yet.
+                _ if !trusted => {
+                    let reason = format!("k5:{} is not on the web of trust yet", peer.k5);
+                    reply(&mut send, REFUSED, &reason).await?;
+                }
+                MESSAGE if !self.rates.allow(&peer.k5, Instant::now()) => {
+                    reply(&mut send, REFUSED, "too many messages, try again later").await?;
+                }
                 MESSAGE => {
                     let received = self.k5.receive(&peer.k5, &text).await;
                     let received = received
-                        .map_err(|e| e.to_string())
+                        .map_err(|e| format!("{e:#}"))
                         .and_then(|message| message.opened);
                     match received {
                         Ok(opened) => {
@@ -379,7 +515,7 @@ impl Handler {
                     }
                 }
                 EXPORT_REQUEST => {
-                    let export = self.k5.export().await.map_err(|e| e.to_string());
+                    let export = self.k5.export().await.map_err(|e| format!("{e:#}"));
                     match export {
                         Ok(export) => {
                             reply(&mut send, EXPORT, &export.markdown).await?;
@@ -405,16 +541,16 @@ pub fn load_or_create_secret(config: &Path) -> Result<SecretKey, Error> {
         let hex = section
             .get("secret_key")
             .and_then(toml::Value::as_str)
-            .ok_or_else(|| {
+            .with_context(|| {
                 format!(
                     "[{CONFIG_SECTION}] of {} has no secret_key",
                     config.display()
                 )
             })?;
         let bytes: [u8; 32] = hex::decode(hex)
-            .map_err(|e| format!("invalid [{CONFIG_SECTION}] secret_key: {e}"))?
+            .with_context(|| format!("invalid [{CONFIG_SECTION}] secret_key"))?
             .try_into()
-            .map_err(|_| format!("invalid [{CONFIG_SECTION}] secret_key: expected 32 bytes"))?;
+            .map_err(|_| anyhow!("invalid [{CONFIG_SECTION}] secret_key: expected 32 bytes"))?;
         return Ok(SecretKey::from_bytes(&bytes));
     }
 
@@ -426,4 +562,24 @@ pub fn load_or_create_secret(config: &Path) -> Result<SecretKey, Error> {
     key::store_section(config, CONFIG_SECTION, toml::Value::Table(section))?;
 
     Ok(secret)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_rates() {
+        let rates = Rates::default();
+        let start = Instant::now();
+
+        for _ in 0..MESSAGE_RATE {
+            assert!(rates.allow("a", start));
+        }
+        assert!(!rates.allow("a", start));
+        // Each k5 has its own rate.
+        assert!(rates.allow("b", start));
+        // A new window starts after the current one.
+        assert!(rates.allow("a", start + MESSAGE_WINDOW));
+    }
 }

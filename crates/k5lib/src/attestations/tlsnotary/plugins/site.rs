@@ -3,6 +3,8 @@
 // `https://<domain>/k5.txt` on a domain without subdomain, e.g.
 // `https://example.com/k5.txt`.
 
+use anyhow::Context as _;
+
 use super::{find_k5, Error, Plugin, Profile, Session};
 
 const PATH: &str = "/k5.txt";
@@ -15,7 +17,7 @@ impl Plugin for Site {
     }
 
     fn profile(&self, session: &Session) -> Result<Profile, Error> {
-        let k5 = find_k5(session.response_body()?).ok_or("k5.txt has no `k5:` value")?;
+        let k5 = find_k5(session.response_body()?).context("k5.txt has no `k5:` value")?;
 
         Ok(Profile {
             platform: "site",

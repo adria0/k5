@@ -5,6 +5,7 @@
 // returns a small JSON document over HTTP/1.1 without requiring
 // authentication.
 
+use anyhow::{anyhow, Context as _};
 use hyper::Uri;
 
 use super::{find_k5, Error, Plugin, Profile, Session, Target};
@@ -29,7 +30,7 @@ impl Plugin for X {
         }
 
         let Some(tweet_id) = parse_tweet_id(uri.path()) else {
-            return Some(Err(format!("could not parse tweet id from `{uri}`").into()));
+            return Some(Err(anyhow!("could not parse tweet id from `{uri}`")));
         };
 
         // The syndication endpoint requires a `token` parameter but does not
@@ -53,14 +54,14 @@ impl Plugin for X {
             let reason = tweet["tombstone"]["text"]["text"]
                 .as_str()
                 .unwrap_or("unknown reason");
-            return Err(format!("tweet is not available: {reason}").into());
+            return Err(anyhow!("tweet is not available: {reason}"));
         }
 
         let user = tweet["user"]["screen_name"]
             .as_str()
-            .ok_or("tweet has no user")?;
-        let text = tweet["text"].as_str().ok_or("tweet has no text")?;
-        let k5 = find_k5(text).ok_or_else(|| format!("tweet has no `k5:` value: {text}"))?;
+            .context("tweet has no user")?;
+        let text = tweet["text"].as_str().context("tweet has no text")?;
+        let k5 = find_k5(text).with_context(|| format!("tweet has no `k5:` value: {text}"))?;
 
         Ok(Profile {
             platform: "X",

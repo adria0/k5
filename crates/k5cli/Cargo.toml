@@ -16,6 +16,7 @@ path = "src/main.rs"
 zkemail = ["k5lib/zkemail"]
 
 [dependencies]
+anyhow = { workspace = true }
 k5lib = { path = "../k5lib" }
 # `k5cli p2p`: messages and sync with other k5s over iroh.
 k5net = { path = "../k5net" }

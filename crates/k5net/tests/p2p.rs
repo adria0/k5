@@ -1,6 +1,7 @@
 // Nodes on localhost, finding each other through a shared in-memory address
-// book (no n0 infrastructure): first contact by ticket, messages both ways,
-// sync, and refusal of k5s outside the web of trust.
+// book (no n0 infrastructure): first contact by ticket, pairing with check
+// phrases, messages both ways, sync, presence, and refusal of k5s outside the
+// web of trust.
 
 use std::{
     path::PathBuf,
@@ -23,14 +24,14 @@ struct TestNode {
 
 impl TestNode {
     async fn spawn(name: &str, lookup: &MemoryLookup) -> Self {
+        // Unique across the tests of this process, which run in parallel.
+        static NEXT: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
         let dir = std::env::temp_dir().join(format!(
             "k5net-test-{name}-{}-{}",
             std::process::id(),
-            std::time::SystemTime::now()
-                .duration_since(std::time::UNIX_EPOCH)
-                .unwrap()
-                .as_nanos()
+            NEXT.fetch_add(1, std::sync::atomic::Ordering::Relaxed)
         ));
+        let _ = std::fs::remove_dir_all(&dir);
         std::fs::create_dir_all(&dir).unwrap();
         let config = dir.join("k5.toml");
         let k5 = Arc::new(
@@ -103,12 +104,16 @@ async fn test_messages_and_sync() {
     // They meet and keysign each other, then alice uses bob's ticket.
     alice.k5.keysign(&bob.k5(), "Bob").await.unwrap();
     bob.k5.keysign(&alice.k5(), "Alice").await.unwrap();
-    let peer = alice
+    let contact = alice
         .node
         .connect_ticket(&bob.node.ticket().await.unwrap())
         .await
         .unwrap();
-    assert_eq!(peer, bob.k5());
+    assert_eq!(contact.k5, bob.k5());
+    assert!(contact.trusted);
+    // Both answer by k5 now.
+    alice.node.ping(&bob.k5()).await.unwrap();
+    bob.node.ping(&alice.k5()).await.unwrap();
 
     // Both learned the other's iroh attestation from the hello.
     for (node, other) in [(&alice, &bob), (&bob, &alice)] {
@@ -194,18 +199,68 @@ async fn test_messages_and_sync() {
 }
 
 #[tokio::test(flavor = "multi_thread")]
+async fn test_pairing() {
+    let lookup = MemoryLookup::new();
+    let alice = TestNode::spawn("alice", &lookup).await;
+    let bob = TestNode::spawn("bob", &lookup).await;
+
+    // Strangers: bob hands alice a ticket, which opens his pairing window.
+    let contact = alice
+        .node
+        .connect_ticket(&bob.node.ticket().await.unwrap())
+        .await
+        .unwrap();
+    assert_eq!(contact.k5, bob.k5());
+    assert!(!contact.trusted);
+    let (k5, trusted, phrase) = bob
+        .event(|event| match event {
+            Event::Paired {
+                k5,
+                trusted,
+                phrase,
+            } => Some((k5.clone(), *trusted, phrase.clone())),
+            _ => None,
+        })
+        .await;
+    assert_eq!((k5.as_str(), trusted), (alice.k5().as_str(), false));
+    // The same check phrase on both sides.
+    assert_eq!(phrase, contact.phrase);
+    assert_eq!(phrase.split(' ').count(), 4);
+
+    // Each stored the other's records, but they do not talk before
+    // keysigning each other.
+    assert!(bob.k5.iroh_endpoint(&alice.k5()).await.unwrap().is_some());
+    let err = alice.node.send(&bob.k5(), "hi").await.unwrap_err();
+    assert!(err.to_string().contains("not on the web of trust"), "{err}");
+
+    // The phrases match: they keysign each other, and talk.
+    alice.k5.keysign(&bob.k5(), "Bob").await.unwrap();
+    bob.k5.keysign(&alice.k5(), "Alice").await.unwrap();
+    alice.node.send(&bob.k5(), "hello bob").await.unwrap();
+    let msg = bob
+        .event(|event| match event {
+            Event::Received { msg, .. } => Some(msg.clone()),
+            _ => None,
+        })
+        .await;
+    assert_eq!(msg, "hello bob");
+
+    alice.stop().await;
+    bob.stop().await;
+}
+
+#[tokio::test(flavor = "multi_thread")]
 async fn test_untrusted_is_refused() {
     let lookup = MemoryLookup::new();
     let alice = TestNode::spawn("alice", &lookup).await;
     let mallory = TestNode::spawn("mallory", &lookup).await;
 
-    // mallory trusts alice, but alice does not know mallory: alice refuses.
+    // mallory trusts alice and got her ticket, but alice closed her pairing
+    // window: she refuses mallory.
     mallory.k5.keysign(&alice.k5(), "Alice").await.unwrap();
-    let err = mallory
-        .node
-        .connect_ticket(&alice.node.ticket().await.unwrap())
-        .await
-        .unwrap_err();
+    let ticket = alice.node.ticket().await.unwrap();
+    alice.node.stop_pairing();
+    let err = mallory.node.connect_ticket(&ticket).await.unwrap_err();
     assert!(err.to_string().contains("not on the web of trust"), "{err}");
     let (endpoint, reason) = alice
         .event(|event| match event {
@@ -223,17 +278,25 @@ async fn test_untrusted_is_refused() {
         .unwrap()
         .is_none());
 
-    // The other way: alice does not trust mallory, so she refuses to talk to
-    // her, even though mallory would accept.
-    let err = alice
+    // Paired while the window is open, mallory's requests are still refused
+    // until alice keysigns her.
+    let contact = mallory
         .node
-        .connect_ticket(&mallory.node.ticket().await.unwrap())
+        .connect_ticket(&alice.node.ticket().await.unwrap())
         .await
-        .unwrap_err();
-    assert!(
-        err.to_string().contains("not on your web of trust"),
-        "{err}"
-    );
+        .unwrap();
+    assert_eq!(contact.k5, alice.k5());
+    let (k5, trusted) = alice
+        .event(|event| match event {
+            Event::Paired { k5, trusted, .. } => Some((k5.clone(), *trusted)),
+            _ => None,
+        })
+        .await;
+    assert_eq!((k5.as_str(), trusted), (mallory.k5().as_str(), false));
+    let err = mallory.node.send(&alice.k5(), "hi").await.unwrap_err();
+    assert!(err.to_string().contains("not on the web of trust"), "{err}");
+    assert!(mallory.node.ping(&alice.k5()).await.is_err());
+    assert!(alice.k5.read_inbox().await.unwrap().is_empty());
 
     alice.stop().await;
     mallory.stop().await;

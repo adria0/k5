@@ -8,6 +8,7 @@ mod fakegraph;
 mod local_notary;
 mod p2p;
 
+use anyhow::anyhow;
 use clap::{Args, Parser, Subcommand};
 
 use k5lib::api::{
@@ -260,7 +261,7 @@ struct VerifyArgs {
 }
 
 #[tokio::main]
-async fn main() -> Result<(), Box<dyn std::error::Error>> {
+async fn main() -> anyhow::Result<()> {
     tracing_subscriber::fmt()
         .with_writer(std::io::stderr)
         .init();
@@ -330,7 +331,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 }
 
 #[cfg(feature = "zkemail")]
-fn run_zkemail(args: &ZkemailArgs) -> Result<(), Box<dyn std::error::Error>> {
+fn run_zkemail(args: &ZkemailArgs) -> anyhow::Result<()> {
     let proof = k5lib::api::zkemail(&args.eml, &args.dkim)?;
     std::fs::write(&args.output, &proof.bytes)?;
     println!(
@@ -345,7 +346,7 @@ fn run_zkemail(args: &ZkemailArgs) -> Result<(), Box<dyn std::error::Error>> {
     Ok(())
 }
 
-async fn run_notarize(args: &NotarizeArgs, k5: &K5) -> Result<(), Box<dyn std::error::Error>> {
+async fn run_notarize(args: &NotarizeArgs, k5: &K5) -> anyhow::Result<()> {
     // Kept alive until the notarization is done.
     let (config, _local_notary) = match &args.notary_host {
         Some(host) => {
@@ -391,7 +392,7 @@ fn print_invalid(listing: &Listing) {
     }
 }
 
-async fn run_list(k5: &K5) -> Result<(), Box<dyn std::error::Error>> {
+async fn run_list(k5: &K5) -> anyhow::Result<()> {
     let listing = k5.list().await?;
     print_invalid(&listing);
     if listing.attestations.is_empty() {
@@ -402,7 +403,7 @@ async fn run_list(k5: &K5) -> Result<(), Box<dyn std::error::Error>> {
     Ok(())
 }
 
-async fn run_search(args: &SearchArgs, k5: &K5) -> Result<(), Box<dyn std::error::Error>> {
+async fn run_search(args: &SearchArgs, k5: &K5) -> anyhow::Result<()> {
     let found = k5.search(&args.pattern).await?;
     print_invalid(&found);
     if found.attestations.is_empty() {
@@ -453,7 +454,7 @@ fn print_tree(attestations: &[ProfileAttestation]) {
     }
 }
 
-async fn run_audit(k5: &K5) -> Result<(), Box<dyn std::error::Error>> {
+async fn run_audit(k5: &K5) -> anyhow::Result<()> {
     let checked = k5.audit().await?;
 
     let mut invalid = 0;
@@ -473,13 +474,13 @@ async fn run_audit(k5: &K5) -> Result<(), Box<dyn std::error::Error>> {
         checked.len() - invalid
     );
     if invalid > 0 {
-        return Err(format!("{invalid} invalid attestations").into());
+        return Err(anyhow!("{invalid} invalid attestations"));
     }
 
     Ok(())
 }
 
-async fn run_export(args: &ExportArgs, k5: &K5) -> Result<(), Box<dyn std::error::Error>> {
+async fn run_export(args: &ExportArgs, k5: &K5) -> anyhow::Result<()> {
     let export = k5.export().await?;
     for skipped in &export.skipped {
         eprintln!(
@@ -495,7 +496,7 @@ async fn run_export(args: &ExportArgs, k5: &K5) -> Result<(), Box<dyn std::error
     Ok(())
 }
 
-async fn run_merge(args: &MergeArgs, k5: &K5) -> Result<(), Box<dyn std::error::Error>> {
+async fn run_merge(args: &MergeArgs, k5: &K5) -> anyhow::Result<()> {
     let markdown = tokio::fs::read_to_string(&args.file).await?;
     let report = k5.merge(&markdown, args.force).await?;
 
@@ -504,7 +505,7 @@ async fn run_merge(args: &MergeArgs, k5: &K5) -> Result<(), Box<dyn std::error::
 
 /// Prints what a merge did with each attestation of the export from
 /// `source`. Fails if any was invalid.
-fn print_merge(report: &MergeReport, source: &str) -> Result<(), Box<dyn std::error::Error>> {
+fn print_merge(report: &MergeReport, source: &str) -> anyhow::Result<()> {
     println!("Valid signature from k5:{}", report.signer);
 
     let mut invalid = 0;
@@ -541,13 +542,13 @@ fn print_merge(report: &MergeReport, source: &str) -> Result<(), Box<dyn std::er
         report.merged.len(),
     );
     if invalid > 0 {
-        return Err(format!("{invalid} invalid attestations").into());
+        return Err(anyhow!("{invalid} invalid attestations"));
     }
 
     Ok(())
 }
 
-async fn run_fakegraph(args: &FakegraphArgs, k5: &K5) -> Result<(), Box<dyn std::error::Error>> {
+async fn run_fakegraph(args: &FakegraphArgs, k5: &K5) -> anyhow::Result<()> {
     let seed = match &args.seed {
         Some(seed) => fakegraph::parse_seed(seed)?,
         None => fakegraph::DEFAULT_SEED,
@@ -600,7 +601,7 @@ async fn run_fakegraph(args: &FakegraphArgs, k5: &K5) -> Result<(), Box<dyn std:
     Ok(())
 }
 
-async fn run_makedot(args: &MakedotArgs, k5: &K5) -> Result<(), Box<dyn std::error::Error>> {
+async fn run_makedot(args: &MakedotArgs, k5: &K5) -> anyhow::Result<()> {
     let graph = k5.graph().await?;
 
     tokio::fs::write(&args.out, &graph.dot).await?;
@@ -613,7 +614,7 @@ async fn run_makedot(args: &MakedotArgs, k5: &K5) -> Result<(), Box<dyn std::err
     Ok(())
 }
 
-async fn run_sign(args: &SignArgs, k5: &K5) -> Result<(), Box<dyn std::error::Error>> {
+async fn run_sign(args: &SignArgs, k5: &K5) -> anyhow::Result<()> {
     let armored = k5.sign(&args.msg).await?;
 
     print!("{armored}");
@@ -623,13 +624,13 @@ async fn run_sign(args: &SignArgs, k5: &K5) -> Result<(), Box<dyn std::error::Er
     Ok(())
 }
 
-async fn run_keysign(args: &KeysignArgs, k5: &K5) -> Result<(), Box<dyn std::error::Error>> {
+async fn run_keysign(args: &KeysignArgs, k5: &K5) -> anyhow::Result<()> {
     println!("{}", k5.keysign(&args.k5, &args.name).await?);
 
     Ok(())
 }
 
-async fn run_signcrypt(args: &SigncryptArgs, k5: &K5) -> Result<(), Box<dyn std::error::Error>> {
+async fn run_signcrypt(args: &SigncryptArgs, k5: &K5) -> anyhow::Result<()> {
     let sealed = k5.signcrypt(&args.k5, &args.msg).await?;
 
     print!("{}", sealed.armored);
@@ -642,13 +643,13 @@ async fn run_signcrypt(args: &SigncryptArgs, k5: &K5) -> Result<(), Box<dyn std:
     Ok(())
 }
 
-async fn run_verify(args: &VerifyArgs, k5: &K5) -> Result<(), Box<dyn std::error::Error>> {
+async fn run_verify(args: &VerifyArgs, k5: &K5) -> anyhow::Result<()> {
     let content = tokio::fs::read_to_string(&args.file).await?;
 
     match k5
         .verify(&content)
         .await
-        .map_err(|e| format!("{}: {e}", args.file))?
+        .map_err(|e| anyhow!("{}: {e:#}", args.file))?
     {
         Verification::Signed {
             from,
@@ -698,7 +699,7 @@ fn print_attested_by(listing: &Listing) {
 /// Prints a verified attestation record: its profile (and signer for key
 /// sign party attestations), or the full transcript if no plugin handles a
 /// TLSNotary record.
-fn print_attested(attested: Attested) -> Result<(), Box<dyn std::error::Error>> {
+fn print_attested(attested: Attested) -> anyhow::Result<()> {
     let fake = if attested.is_fake() { " [fake]" } else { "" };
     let verified = match attested {
         Attested::Tlsn(verified) => verified,

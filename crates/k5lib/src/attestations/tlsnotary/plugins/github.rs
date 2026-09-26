@@ -4,6 +4,8 @@
 // returns 404 if `<user>` does not own the gist, so a 200 response proves the
 // user.
 
+use anyhow::Context as _;
+
 use super::{find_k5, Error, Plugin, Profile, Session};
 
 const GIST_DOMAIN: &str = "gist.githubusercontent.com";
@@ -16,15 +18,15 @@ impl Plugin for Github {
     }
 
     fn profile(&self, session: &Session) -> Result<Profile, Error> {
-        let path = session.request_target().ok_or("request has no target")?;
+        let path = session.request_target().context("request has no target")?;
         let user = path
             .trim_start_matches('/')
             .split(['/', '?'])
             .next()
             .filter(|user| !user.is_empty())
-            .ok_or_else(|| format!("could not parse gist user from `{path}`"))?;
+            .with_context(|| format!("could not parse gist user from `{path}`"))?;
 
-        let k5 = find_k5(session.response_body()?).ok_or("gist has no `k5:` value")?;
+        let k5 = find_k5(session.response_body()?).context("gist has no `k5:` value")?;
 
         Ok(Profile {
             platform: "github",

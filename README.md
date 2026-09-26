@@ -101,13 +101,20 @@ merge and sync, so the web of trust is how k5s find each other; n0's address
 lookup and relays find the way to the endpoint. On every connection both sides
 prove their k5 and check the other is on their web of trust.
 
-First contact, after keysigning each other:
+First contact is a pairing, by ticket. A ticket opens a 10 minute pairing
+window, during which k5s not on your web of trust yet may connect with it:
+both sides store each other's records and print the same **check phrase**
+(four words). Compare them (aloud, or on a call): if they match, you paired
+with who you think, so keysign each other; until then, neither serves the
+other.
 
 ```sh
 # Alice
 k5cli p2p listen               # prints a ticket, serves until Ctrl-C
 # Bob
-k5cli p2p connect k5ticket:... # both learn how to reach each other
+k5cli p2p connect k5ticket:... # both learn how to reach each other, and
+                               # print the check phrase
+k5cli attest keysign k5:<alice> "Alice"   # if the phrases match (both sides)
 ```
 
 From then on, by k5:
@@ -125,11 +132,31 @@ servers see endpoint ids and IP addresses, never k5s or message content.
 
 `k5gui` searches the attestations, shows the dossier of an identity (profiles,
 trust path), sends it messages, syncs with it, and shows the inbox. It goes
-online at start; `TICKET` and `CONNECT` handle the first contact.
+online at start. The menu of the main screen (the three lines) has:
+
+- `ME`: your attestations.
+- `VERIFY`: paste a signed message, a message for you or an attestation
+  record, and see who signed it and whether they are on your web of trust.
+- `TICKET` and `CONNECT`: the first contact, a pairing. Both windows show the
+  check phrase; if they match, keysign the other from the dialog.
+- `AUTO SYNC`: every minute, the trusted k5s that can be reached peer to peer
+  are checked for presence (`P2P · ONLINE`), and every 10 minutes their
+  attestations are merged. On by default.
+- `ATTEST`: attest your X, GitHub or website: publish your k5 there, paste the
+  URL (or type the domain) and a remote TLSNotary notary attests it. Email
+  attestations are not available yet.
 
 ```sh
-k5gui [--config k5.toml] [--db db] [--offline]
+k5gui [--config k5.toml] [--db db] [--offline] \
+      [--notary-host <host> [--notary-port 7047] [--notary-tls]] [--notary-key <hex>]
 ```
+
+On the first run, if the config file does not exist, `k5gui` creates it with
+new keys, as `k5cli init` does.
+
+Attesting needs `--notary-host`, and the notary must sign with `--notary-key`
+(the default is the key of `k5cli`'s local notary). Presentations are written
+to `<db>/presentations/`.
 
 To try two clients on one machine: `k5gui --config a.toml --db a/` and
 `k5gui --config b.toml --db b/`.

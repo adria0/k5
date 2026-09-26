@@ -1,20 +1,43 @@
 // k5 terminal: a dot-matrix, grid paper interface to search the
 // attestations, inspect the dossier of an identity, chat with it and sync
-// with it peer to peer.
+// with it peer to peer (pairing with check phrases, presence, automatic
+// sync), attest the profiles of the local k5, and verify what others signed.
 
 import "fonts/VT323-Regular.ttf";
 import "fonts/Doto.ttf";
 
-// A search result: an attestation of a profile, deduplicated.
+// A search result: a k5 and who it is.
 export struct Hit {
-    // Icon key: x, github, site, keysign, self or other.
-    platform: string,
-    label: string,
-    user: string,
     k5: string,
     short: string,
-    // Number of identical attestations (e.g. keysigns by several signers).
-    count: int,
+    // Its profiles (`X:handle · GITHUB:user`), or else the name it was
+    // keysigned with, or else its short k5.
+    label: string,
+    // Has an iroh attestation: can be reached peer to peer.
+    p2p: bool,
+    // Answered the last presence check.
+    online: bool,
+}
+
+// The result of verifying something pasted on the VERIFY screen.
+export struct Verdict {
+    ok: bool,
+    // What it is, or why it did not verify.
+    title: string,
+    // Who signed it or what it attests.
+    who: string,
+    // Whether that k5 is on the web of trust.
+    trust: string,
+    // The message, or the details.
+    body: string,
+}
+
+// An attestation of the local k5, on the ME screen.
+export struct Owned {
+    // PixelIcon platform.
+    icon: string,
+    title: string,
+    detail: string,
 }
 
 // A k5 on the trust path, from the selected identity down to the local one.
@@ -35,6 +58,8 @@ export struct Dossier {
     kem: bool,
     // Has an iroh attestation: can be reached peer to peer.
     online: bool,
+    // Answered the last presence check.
+    live: bool,
     trusted: bool,
     me: bool,
     x: int,
@@ -76,6 +101,8 @@ global Palette {
     // Disabled controls only.
     out property <color> faint: #8a8373;
     out property <color> shade: #1c1b1899;
+    // Reachable peer to peer.
+    out property <color> online: #2f6b3a;
 }
 
 component DotsH inherits Image {
@@ -113,6 +140,22 @@ component PixelIcon {
         1,1,1,1,1,1,1,
         0,1,0,1,0,1,0,
         0,0,1,1,1,0,0,
+    ] : platform == "email" ? [
+        1,1,1,1,1,1,1,
+        1,1,0,0,0,1,1,
+        1,0,1,0,1,0,1,
+        1,0,0,1,0,0,1,
+        1,0,0,0,0,0,1,
+        1,0,0,0,0,0,1,
+        1,1,1,1,1,1,1,
+    ] : platform == "p2p" ? [
+        0,0,0,0,0,0,0,
+        1,1,0,0,0,1,1,
+        1,1,0,0,0,1,1,
+        1,1,1,1,1,1,1,
+        1,1,0,0,0,1,1,
+        1,1,0,0,0,1,1,
+        0,0,0,0,0,0,0,
     ] : platform == "keysign" ? [
         0,0,0,0,0,0,0,
         0,0,0,0,0,0,0,
@@ -229,6 +272,47 @@ component Gauge {
     }
 }
 
+// A text input with a terminal cursor: a blinking horizontal line under the
+// character at the cursor, instead of the usual vertical bar.
+component TermInput inherits TextInput {
+    // Top left of the cursor, once the input reports it (it does when the
+    // cursor first moves).
+    property <Point> caret;
+    property <bool> caret-known;
+    // Until then, the cursor is at the start of the first line.
+    property <length> line-height: self.font-metrics.ascent - self.font-metrics.descent;
+    property <length> first-line: self.vertical-alignment == TextVerticalAlignment.center ? (self.height - self.line-height) / 2 : self.vertical-alignment == TextVerticalAlignment.bottom ? self.height - self.line-height : 0px;
+    property <bool> blink-on: true;
+    // Hides the built-in cursor.
+    text-cursor-width: 0px;
+    color: Palette.text;
+    selection-background-color: Palette.paper-hi;
+    selection-foreground-color: Palette.text;
+    cursor-position-changed(position) => {
+        self.caret = position;
+        self.caret-known = true;
+        // Solid while typing or moving.
+        self.blink-on = true;
+    }
+
+    Rectangle {
+        x: root.caret-known ? root.caret.x : 0px;
+        y: (root.caret-known ? root.caret.y : root.first-line) + root.font-metrics.ascent + 2px;
+        width: root.font-size * 0.45;
+        height: 3px;
+        background: Palette.ink;
+        visible: root.has-focus && root.blink-on;
+    }
+
+    Timer {
+        interval: 530ms;
+        running: root.has-focus;
+        triggered => {
+            root.blink-on = !root.blink-on;
+        }
+    }
+}
+
 component TermButton {
     in property <string> text;
     in property <bool> enabled: true;
@@ -272,43 +356,62 @@ component ScrollMark inherits Rectangle {
     }
 }
 
-component HitRow inherits Rectangle {
-    in property <Hit> hit;
+// An identity, as in the search results and the trust path: who it is and
+// its short k5. The local k5 has a thicker border.
+component IdCard {
+    in property <string> label;
+    in property <string> short;
+    in property <bool> me;
+    in property <bool> show-k5: true;
+    // Shows a P2P mark: it can be reached peer to peer.
+    in property <bool> p2p;
+    // The P2P mark says it answered the last presence check.
+    in property <bool> online;
+    in property <bool> clickable;
     callback clicked;
-    height: 56px;
-    background: touch.has-hover ? Palette.paper-hi : transparent;
-    HorizontalLayout {
-        padding-left: 6px;
-        padding-right: 6px;
-        spacing: 14px;
-        VerticalLayout {
-            alignment: center;
-            PixelIcon {
-                platform: root.hit.platform;
-                cell: 4px;
-            }
+    Rectangle {
+        border-width: root.me ? 3px : 2px;
+        border-color: Palette.ink;
+        background: root.clickable && touch.has-hover ? Palette.paper-hi : transparent;
+    }
+
+    VerticalLayout {
+        padding: 8px;
+        padding-left: 10px;
+        Text {
+            color: Palette.text;
+            text: root.label;
+            font-size: 24px;
+            wrap: word-wrap;
         }
 
-        VerticalLayout {
-            alignment: center;
+        if root.show-k5: HorizontalLayout {
+            spacing: 8px;
             Text {
-                color: Palette.text;
-                text: root.hit.label + " : " + root.hit.user;
-                font-size: 26px;
-                overflow: elide;
+                horizontal-stretch: 1;
+                color: Palette.dim;
+                text: "k5:" + root.short + (root.me ? "  YOU" : "");
+                font-size: 18px;
+                vertical-alignment: center;
             }
 
-            Text {
-                text: "k5:" + root.hit.short + (root.hit.count > 1 ? "  x" + root.hit.count : "");
-                color: Palette.dim;
-                font-size: 19px;
-                overflow: elide;
+            if root.p2p: Rectangle {
+                horizontal-stretch: 0;
+                width: p2p-label.preferred-width + 10px;
+                height: 18px;
+                background: Palette.online;
+                p2p-label := Text {
+                    text: root.online ? "P2P · ONLINE" : "P2P";
+                    color: Palette.paper;
+                    font-size: 16px;
+                }
             }
         }
     }
 
     touch := TouchArea {
-        mouse-cursor: pointer;
+        enabled: root.clickable;
+        mouse-cursor: root.clickable ? MouseCursor.pointer : MouseCursor.default;
         clicked => {
             root.clicked();
         }
@@ -376,6 +479,192 @@ component ChatRow {
     }
 }
 
+// An entry of the menu.
+component MenuItem inherits Rectangle {
+    in property <string> text;
+    // PixelIcon platform, none if empty.
+    in property <string> icon;
+    in property <bool> enabled: true;
+    callback clicked;
+    height: 44px;
+    background: root.enabled && touch.has-hover ? Palette.paper-hi : transparent;
+    HorizontalLayout {
+        padding-left: 10px;
+        padding-right: 10px;
+        spacing: 12px;
+        if root.icon != "": VerticalLayout {
+            alignment: center;
+            PixelIcon {
+                platform: root.icon;
+                cell: 3px;
+                ink: root.enabled ? Palette.ink : Palette.faint;
+            }
+        }
+
+        Text {
+            text: root.text;
+            font-size: 26px;
+            color: root.enabled ? Palette.text : Palette.faint;
+            vertical-alignment: center;
+        }
+    }
+
+    touch := TouchArea {
+        enabled: root.enabled;
+        mouse-cursor: pointer;
+        clicked => {
+            root.clicked();
+        }
+    }
+}
+
+// The menu of the main screen, behind a button with three horizontal lines:
+// the first contact peer to peer (ticket, connect), and attesting the
+// profiles of the local k5.
+component MainMenu {
+    // Online peer to peer.
+    in property <bool> online;
+    in property <bool> busy;
+    in property <bool> auto-sync;
+    // Show the attestations of the local k5.
+    callback mine();
+    callback verify();
+    callback toggle-auto-sync();
+    callback ticket();
+    callback connect();
+    // Attest a profile of the local k5: email, x, github or site.
+    callback attest(string);
+    // Showing the profiles to attest instead of the main entries.
+    property <bool> attesting;
+    width: 40px;
+    height: 40px;
+
+    Rectangle {
+        border-width: 2px;
+        border-color: Palette.ink;
+        background: touch.has-hover ? Palette.paper-hi : transparent;
+    }
+
+    VerticalLayout {
+        alignment: center;
+        padding-left: 9px;
+        padding-right: 9px;
+        spacing: 5px;
+        for i in 3: Rectangle {
+            height: 4px;
+            background: Palette.ink;
+        }
+    }
+
+    touch := TouchArea {
+        mouse-cursor: pointer;
+        clicked => {
+            root.attesting = false;
+            popup.show();
+        }
+    }
+
+    // Entries act before closing the popup: closing destroys it, and the
+    // rest of the handler would not run.
+    popup := PopupWindow {
+        x: root.width - self.width;
+        y: root.height + 6px;
+        width: 250px;
+        close-policy: PopupClosePolicy.close-on-click-outside;
+        Rectangle {
+            background: Palette.paper;
+            border-width: 3px;
+            border-color: Palette.ink;
+            VerticalLayout {
+                padding: 6px;
+                spacing: 2px;
+                if !root.attesting: MenuItem {
+                    text: "ME";
+                    clicked => {
+                        root.mine();
+                        popup.close();
+                    }
+                }
+                if !root.attesting: MenuItem {
+                    text: "VERIFY";
+                    clicked => {
+                        root.verify();
+                        popup.close();
+                    }
+                }
+                if !root.attesting: MenuItem {
+                    text: "TICKET";
+                    enabled: root.online;
+                    clicked => {
+                        root.ticket();
+                        popup.close();
+                    }
+                }
+                if !root.attesting: MenuItem {
+                    text: "CONNECT";
+                    enabled: root.online && !root.busy;
+                    clicked => {
+                        root.connect();
+                        popup.close();
+                    }
+                }
+                if !root.attesting: MenuItem {
+                    text: "AUTO SYNC: " + (root.auto-sync ? "ON" : "OFF");
+                    enabled: root.online;
+                    clicked => {
+                        root.toggle-auto-sync();
+                        popup.close();
+                    }
+                }
+                if !root.attesting: MenuItem {
+                    text: "ATTEST >";
+                    clicked => {
+                        root.attesting = true;
+                    }
+                }
+                if root.attesting: MenuItem {
+                    text: "< ATTEST";
+                    clicked => {
+                        root.attesting = false;
+                    }
+                }
+                if root.attesting: MenuItem {
+                    text: "MY EMAIL";
+                    icon: "email";
+                    clicked => {
+                        root.attest("email");
+                        popup.close();
+                    }
+                }
+                if root.attesting: MenuItem {
+                    text: "MY X";
+                    icon: "x";
+                    clicked => {
+                        root.attest("x");
+                        popup.close();
+                    }
+                }
+                if root.attesting: MenuItem {
+                    text: "MY GITHUB";
+                    icon: "github";
+                    clicked => {
+                        root.attest("github");
+                        popup.close();
+                    }
+                }
+                if root.attesting: MenuItem {
+                    text: "MY WEBSITE";
+                    icon: "site";
+                    clicked => {
+                        root.attest("site");
+                        popup.close();
+                    }
+                }
+            }
+        }
+    }
+}
+
 export component AppWindow inherits Window {
     in property <string> me;
     in property <string> stats-ids: "--";
@@ -407,6 +696,46 @@ export component AppWindow inherits Window {
     in-out property <string> draft;
     // The paste-a-ticket dialog is open.
     in-out property <bool> connecting;
+    // The local k5, in full.
+    in property <string> me-k5;
+    // The notary that attests profiles (`host:port`), empty if none is
+    // configured.
+    in property <string> notary;
+    // The profile being attested: email, x, github or site; empty when not
+    // attesting.
+    in-out property <string> attest-kind;
+    // What identifies the profile: a URL, or a domain.
+    in-out property <string> attest-input;
+    // The attestations of the local k5, for the ME screen.
+    in property <[Owned]> owned;
+    // The glyph of the local k5.
+    in property <[int]> me-glyph;
+    // Showing the ME screen.
+    in-out property <bool> show-me;
+    // Showing the VERIFY screen.
+    in-out property <bool> verifying;
+    // What is pasted to verify.
+    in-out property <string> verify-input;
+    in property <Verdict> verdict;
+    // A verdict for the current input is shown.
+    in-out property <bool> has-verdict;
+    // The k5 of the open conversation answered the last presence check.
+    in property <bool> chat-online;
+    // Syncing with the peers that answer, from time to time.
+    in property <bool> auto-sync: true;
+    // The pairing dialog is open: a k5 met by ticket, with the check phrase
+    // to compare before keysigning it.
+    in-out property <bool> pairing;
+    in property <string> pair-k5;
+    in property <string> pair-who;
+    in property <string> pair-phrase;
+    in property <bool> pair-trusted;
+    // The name to keysign the paired k5 with.
+    in-out property <string> pair-name;
+    // A screen opened from the menu covers the others.
+    property <bool> overlay: root.attest-kind != "" || root.show-me || root.verifying;
+    // The main screen (search or chats) is shown.
+    property <bool> main-screen: !root.has-dossier && root.chat-k5 == "" && !root.overlay;
     callback search(string);
     callback select(string);
     callback rescan();
@@ -417,6 +746,18 @@ export component AppWindow inherits Window {
     callback close-chat();
     // Send a message in a conversation: to, message.
     callback chat-send(string, string);
+    // Attest a profile of the local k5: kind, input.
+    callback attest(string, string);
+    // Copy `k5:<the local k5>` to the clipboard.
+    callback copy-k5();
+    // Show the ME screen.
+    callback open-me();
+    // Verify what was pasted: a signed message, a message for the local k5
+    // or an attestation record.
+    callback verify(string);
+    callback toggle-auto-sync();
+    // Keysign a k5: k5, name.
+    callback keysign(string, string);
 
     title: "K5";
     // A phone screen.
@@ -479,8 +820,8 @@ export component AppWindow inherits Window {
 
         DotsH { }
 
-        // Peer to peer.
-        if !root.has-dossier && root.chat-k5 == "": HorizontalLayout {
+        // Chats, and the menu.
+        if root.main-screen: HorizontalLayout {
             spacing: 10px;
             vertical-stretch: 0;
             TermButton {
@@ -493,25 +834,35 @@ export component AppWindow inherits Window {
 
             Rectangle { }
 
-            TermButton {
-                text: "TICKET";
-                enabled: root.endpoint != "";
-                clicked => {
+            MainMenu {
+                online: root.endpoint != "";
+                busy: root.busy;
+                auto-sync: root.auto-sync;
+                mine => {
+                    root.open-me();
+                }
+                verify => {
+                    root.has-verdict = false;
+                    root.verifying = true;
+                }
+                toggle-auto-sync => {
+                    root.toggle-auto-sync();
+                }
+                ticket => {
                     root.copy-ticket();
                 }
-            }
-
-            TermButton {
-                text: "CONNECT";
-                enabled: root.endpoint != "" && !root.busy;
-                clicked => {
+                connect => {
                     root.connecting = true;
+                }
+                attest(kind) => {
+                    root.attest-input = "";
+                    root.attest-kind = kind;
                 }
             }
         }
 
         // Conversations.
-        if !root.has-dossier && root.chat-k5 == "" && root.show-chats: HorizontalLayout {
+        if root.main-screen && root.show-chats: HorizontalLayout {
             spacing: 6px;
             vertical-stretch: 1;
             chats-flick := Flickable {
@@ -545,7 +896,7 @@ export component AppWindow inherits Window {
         }
 
         // A conversation.
-        if !root.has-dossier && root.chat-k5 != "": VerticalLayout {
+        if !root.has-dossier && root.chat-k5 != "" && !root.overlay: VerticalLayout {
             spacing: 10px;
             vertical-stretch: 1;
             HorizontalLayout {
@@ -573,7 +924,7 @@ export component AppWindow inherits Window {
 
                     Text {
                         color: Palette.dim;
-                        text: "k5:" + root.chat-short + (root.chat-reachable ? "  P2P" : "  OFF P2P");
+                        text: "k5:" + root.chat-short + (root.chat-online ? "  P2P · ONLINE" : root.chat-reachable ? "  P2P" : "  OFF P2P");
                         font-size: 18px;
                     }
                 }
@@ -650,7 +1001,7 @@ export component AppWindow inherits Window {
                     border-width: 2px;
                     border-color: Palette.ink;
                     clip: true;
-                    draft-input := TextInput {
+                    draft-input := TermInput {
                         x: 10px;
                         y: 8px;
                         width: parent.width - 20px;
@@ -659,9 +1010,6 @@ export component AppWindow inherits Window {
                         single-line: false;
                         wrap: word-wrap;
                         font-size: 24px;
-                        color: Palette.text;
-                        selection-background-color: Palette.paper-hi;
-                        selection-foreground-color: Palette.text;
                         init => {
                             self.focus();
                         }
@@ -692,7 +1040,7 @@ export component AppWindow inherits Window {
         }
 
         // Search screen.
-        if !root.has-dossier && root.chat-k5 == "" && !root.show-chats: VerticalLayout {
+        if root.main-screen && !root.show-chats: VerticalLayout {
             spacing: 12px;
             vertical-stretch: 1;
             HorizontalLayout {
@@ -708,18 +1056,17 @@ export component AppWindow inherits Window {
                         padding-right: 10px;
                         spacing: 8px;
                         Text {
+                            horizontal-stretch: 0;
                             color: Palette.text;
                             text: ">";
                             font-size: 28px;
                             vertical-alignment: center;
                         }
 
-                        query := TextInput {
+                        query := TermInput {
+                            horizontal-stretch: 1;
                             font-size: 28px;
                             vertical-alignment: center;
-                            color: Palette.text;
-                            selection-background-color: Palette.paper-hi;
-                            selection-foreground-color: Palette.text;
                             init => {
                                 self.focus();
                             }
@@ -730,7 +1077,7 @@ export component AppWindow inherits Window {
                     }
 
                     if query.text == "": Text {
-                        x: 34px;
+                        x: query.x;
                         height: parent.height;
                         vertical-alignment: center;
                         text: "NAME, HANDLE OR K5";
@@ -759,9 +1106,13 @@ export component AppWindow inherits Window {
                     content-height: hits-list.preferred-height;
                     hits-list := VerticalLayout {
                         width: hits-flick.width;
-                        spacing: 2px;
-                        for hit in root.hits: HitRow {
-                            hit: hit;
+                        spacing: 8px;
+                        for hit in root.hits: IdCard {
+                            label: hit.label;
+                            short: hit.short;
+                            p2p: hit.p2p;
+                            online: hit.online;
+                            clickable: true;
                             clicked => {
                                 root.select(hit.k5);
                             }
@@ -783,8 +1134,120 @@ export component AppWindow inherits Window {
             }
         }
 
+        // The attestations of the local k5.
+        if root.show-me && root.attest-kind == "" && !root.verifying: VerticalLayout {
+            spacing: 12px;
+            vertical-stretch: 1;
+            HorizontalLayout {
+                alignment: start;
+                TermButton {
+                    text: "< BACK";
+                    clicked => {
+                        root.show-me = false;
+                    }
+                }
+            }
+
+            HorizontalLayout {
+                spacing: 18px;
+                VerticalLayout {
+                    alignment: start;
+                    Glyph {
+                        bits: root.me-glyph;
+                    }
+                }
+
+                VerticalLayout {
+                    alignment: center;
+                    Text {
+                        color: Palette.text;
+                        text: "ME";
+                        font-family: "Doto";
+                        font-weight: 900;
+                        font-size: 40px;
+                    }
+
+                    Text {
+                        color: Palette.text;
+                        text: root.owned.length + " ATTESTATIONS";
+                        font-size: 22px;
+                    }
+
+                    Text {
+                        color: Palette.text;
+                        text: "P2P   : " + (root.endpoint != "" ? "ONLINE" : "OFFLINE");
+                        font-size: 22px;
+                    }
+                }
+            }
+
+            Text {
+                color: Palette.dim;
+                text: "k5:" + root.me-k5;
+                font-size: 22px;
+                wrap: char-wrap;
+            }
+
+            DotsH { }
+
+            HorizontalLayout {
+                spacing: 6px;
+                vertical-stretch: 1;
+                owned-flick := Flickable {
+                    // Fill the screen even when the content is short.
+                    max-height: 100000px;
+                    content-height: owned-list.preferred-height;
+                    owned-list := VerticalLayout {
+                        width: owned-flick.width;
+                        spacing: 2px;
+                        for owned in root.owned: HorizontalLayout {
+                            padding: 6px;
+                            spacing: 14px;
+                            VerticalLayout {
+                                alignment: center;
+                                PixelIcon {
+                                    platform: owned.icon;
+                                    cell: 4px;
+                                }
+                            }
+
+                            VerticalLayout {
+                                alignment: center;
+                                Text {
+                                    color: Palette.text;
+                                    text: owned.title;
+                                    font-size: 26px;
+                                    overflow: elide;
+                                }
+
+                                Text {
+                                    color: Palette.dim;
+                                    text: owned.detail;
+                                    font-size: 19px;
+                                    overflow: elide;
+                                }
+                            }
+                        }
+
+                        if root.owned.length == 0: Text {
+                            text: "NO ATTESTATIONS: ATTEST YOUR PROFILES FROM THE MENU";
+                            font-size: 24px;
+                            color: Palette.dim;
+                            wrap: word-wrap;
+                        }
+                    }
+                }
+
+                ScrollMark {
+                    offset: owned-flick.content-y;
+                    content: owned-flick.content-height;
+                    view: owned-flick.height;
+                }
+            }
+        }
+
         // Dossier screen.
-        if root.has-dossier: VerticalLayout {
+        if root.has-dossier && !root.overlay: VerticalLayout {
             spacing: 12px;
             vertical-stretch: 1;
             HorizontalLayout {
@@ -831,7 +1294,7 @@ export component AppWindow inherits Window {
 
                     Text {
                         color: Palette.text;
-                        text: "P2P   : " + (root.dossier.online ? "YES" : "NO");
+                        text: "P2P   : " + (root.dossier.live ? "ONLINE" : root.dossier.online ? "YES" : "NO");
                         font-size: 22px;
                     }
                 }
@@ -922,25 +1385,11 @@ export component AppWindow inherits Window {
                                     }
                                 }
 
-                                Rectangle {
-                                    border-width: link.me ? 3px : 2px;
-                                    border-color: Palette.ink;
-                                    VerticalLayout {
-                                        padding: 8px;
-                                        padding-left: 10px;
-                                        Text {
-                                            color: Palette.text;
-                                            text: link.label;
-                                            font-size: 24px;
-                                            wrap: word-wrap;
-                                        }
-
-                                        if !link.me: Text {
-                                            color: Palette.dim;
-                                            text: "k5:" + link.short;
-                                            font-size: 18px;
-                                        }
-                                    }
+                                IdCard {
+                                    label: link.label;
+                                    short: link.short;
+                                    me: link.me;
+                                    show-k5: !link.me;
                                 }
                             }
                         }
@@ -982,6 +1431,294 @@ export component AppWindow inherits Window {
             }
         }
 
+        // Verify a signed message, a message for the local k5 or an
+        // attestation record.
+        if root.verifying && root.attest-kind == "": VerticalLayout {
+            spacing: 12px;
+            vertical-stretch: 1;
+            HorizontalLayout {
+                alignment: start;
+                TermButton {
+                    text: "< BACK";
+                    clicked => {
+                        root.verifying = false;
+                    }
+                }
+            }
+
+            Text {
+                color: Palette.text;
+                text: "VERIFY";
+                font-family: "Doto";
+                font-weight: 900;
+                font-size: 40px;
+            }
+
+            Text {
+                color: Palette.dim;
+                text: "PASTE A SIGNED MESSAGE, A MESSAGE FOR YOU OR AN ATTESTATION RECORD:";
+                font-size: 22px;
+                wrap: word-wrap;
+            }
+
+            Rectangle {
+                height: 150px;
+                border-width: 2px;
+                border-color: Palette.ink;
+                clip: true;
+                TermInput {
+                    x: 10px;
+                    y: 8px;
+                    width: parent.width - 20px;
+                    height: parent.height - 16px;
+                    text <=> root.verify-input;
+                    single-line: false;
+                    wrap: char-wrap;
+                    font-size: 18px;
+                    edited => {
+                        root.has-verdict = false;
+                    }
+                    init => {
+                        self.focus();
+                    }
+                }
+            }
+
+            HorizontalLayout {
+                alignment: end;
+                TermButton {
+                    text: "VERIFY";
+                    primary: true;
+                    enabled: root.verify-input != "" && !root.busy;
+                    clicked => {
+                        root.verify(root.verify-input);
+                    }
+                }
+            }
+
+            if root.has-verdict: Rectangle {
+                vertical-stretch: 1;
+                border-width: root.verdict.ok ? 3px : 2px;
+                border-color: Palette.ink;
+                VerticalLayout {
+                    padding: 10px;
+                    spacing: 6px;
+                    HorizontalLayout {
+                        spacing: 10px;
+                        vertical-stretch: 0;
+                        Rectangle {
+                            horizontal-stretch: 0;
+                            width: mark.preferred-width + 12px;
+                            height: 22px;
+                            background: root.verdict.ok ? Palette.online : Palette.ink;
+                            mark := Text {
+                                text: root.verdict.ok ? "VALID" : "INVALID";
+                                color: Palette.paper;
+                                font-size: 18px;
+                            }
+                        }
+
+                        Text {
+                            horizontal-stretch: 1;
+                            color: Palette.text;
+                            text: root.verdict.title;
+                            font-size: 24px;
+                            wrap: word-wrap;
+                            vertical-alignment: center;
+                        }
+                    }
+
+                    if root.verdict.who != "": Text {
+                        vertical-stretch: 0;
+                        color: Palette.text;
+                        text: root.verdict.who;
+                        font-size: 22px;
+                        wrap: word-wrap;
+                    }
+
+                    if root.verdict.trust != "": Text {
+                        vertical-stretch: 0;
+                        color: Palette.dim;
+                        text: root.verdict.trust;
+                        font-size: 20px;
+                        wrap: word-wrap;
+                    }
+
+                    if root.verdict.body != "": DotsH {
+                        vertical-stretch: 0;
+                    }
+
+                    HorizontalLayout {
+                        spacing: 6px;
+                        vertical-stretch: 1;
+                        verdict-flick := Flickable {
+                            max-height: 100000px;
+                            content-height: verdict-body.preferred-height;
+                            verdict-body := Text {
+                                width: verdict-flick.width;
+                                color: Palette.text;
+                                text: root.verdict.body;
+                                font-size: 20px;
+                                wrap: word-wrap;
+                            }
+                        }
+
+                        ScrollMark {
+                            offset: verdict-flick.content-y;
+                            content: verdict-flick.content-height;
+                            view: verdict-flick.height;
+                        }
+                    }
+                }
+            }
+
+            if !root.has-verdict: Rectangle {
+                vertical-stretch: 1;
+            }
+        }
+
+        // Attest a profile of the local k5: publish the k5 on it, then have
+        // the notary attest the page that shows it.
+        if root.attest-kind != "": VerticalLayout {
+            spacing: 14px;
+            vertical-stretch: 1;
+            HorizontalLayout {
+                alignment: start;
+                TermButton {
+                    text: "< BACK";
+                    clicked => {
+                        root.attest-kind = "";
+                    }
+                }
+            }
+
+            HorizontalLayout {
+                spacing: 16px;
+                alignment: start;
+                VerticalLayout {
+                    alignment: center;
+                    PixelIcon {
+                        platform: root.attest-kind;
+                        cell: 5px;
+                    }
+                }
+
+                Text {
+                    color: Palette.text;
+                    text: root.attest-kind == "x" ? "MY X" : root.attest-kind == "github" ? "MY GITHUB" : root.attest-kind == "site" ? "MY WEBSITE" : "MY EMAIL";
+                    font-family: "Doto";
+                    font-weight: 900;
+                    font-size: 40px;
+                    vertical-alignment: center;
+                }
+            }
+
+            DotsH { }
+
+            if root.attest-kind == "email": Text {
+                vertical-stretch: 0;
+                color: Palette.text;
+                text: "EMAIL ATTESTATIONS ARE NOT AVAILABLE YET. K5CLI CAN PROVE A DKIM-SIGNED EMAIL WITH ZK-EMAIL (K5CLI ZKEMAIL), BUT THE PROOF IS NOT STORED AS AN ATTESTATION.";
+                font-size: 24px;
+                wrap: word-wrap;
+            }
+
+            if root.attest-kind != "email": VerticalLayout {
+                spacing: 14px;
+                vertical-stretch: 0;
+                Text {
+                    color: Palette.text;
+                    text: root.attest-kind == "x" ? "1. POST A TWEET THAT CONTAINS YOUR K5:" : root.attest-kind == "github" ? "1. CREATE A PUBLIC GIST THAT CONTAINS YOUR K5:" : "1. PUBLISH https://YOUR.DOMAIN/k5.txt WITH YOUR K5:";
+                    font-size: 24px;
+                    wrap: word-wrap;
+                }
+
+                Rectangle {
+                    border-width: 2px;
+                    border-color: Palette.ink;
+                    HorizontalLayout {
+                        padding: 10px;
+                        spacing: 10px;
+                        Text {
+                            horizontal-stretch: 1;
+                            color: Palette.text;
+                            text: "k5:" + root.me-k5;
+                            font-size: 22px;
+                            wrap: char-wrap;
+                            vertical-alignment: center;
+                        }
+
+                        VerticalLayout {
+                            alignment: center;
+                            TermButton {
+                                text: "COPY";
+                                clicked => {
+                                    root.copy-k5();
+                                }
+                            }
+                        }
+                    }
+                }
+
+                Text {
+                    color: Palette.text;
+                    text: root.attest-kind == "x" ? "2. PASTE THE URL OF THE TWEET:" : root.attest-kind == "github" ? "2. PASTE THE URL OF THE GIST:" : "2. TYPE THE DOMAIN, WITHOUT SUBDOMAIN:";
+                    font-size: 24px;
+                    wrap: word-wrap;
+                }
+
+                Rectangle {
+                    height: 44px;
+                    border-width: 2px;
+                    border-color: Palette.ink;
+                    clip: true;
+                    attest-input := TermInput {
+                        x: 10px;
+                        width: parent.width - 20px;
+                        height: parent.height;
+                        text <=> root.attest-input;
+                        font-size: 24px;
+                        vertical-alignment: center;
+                        init => {
+                            self.focus();
+                        }
+                    }
+
+                    if root.attest-input == "": Text {
+                        x: 10px;
+                        height: parent.height;
+                        vertical-alignment: center;
+                        text: root.attest-kind == "x" ? "https://x.com/YOU/status/..." : root.attest-kind == "github" ? "https://gist.github.com/YOU/..." : "example.com";
+                        font-size: 24px;
+                        color: Palette.dim;
+                    }
+                }
+
+                Text {
+                    color: Palette.dim;
+                    text: root.notary != "" ? "3. THE NOTARY " + root.notary + " ATTESTS IT. IT TAKES A WHILE." : "NO NOTARY: START K5GUI WITH --notary-host <HOST>";
+                    font-size: 20px;
+                    wrap: word-wrap;
+                }
+
+                HorizontalLayout {
+                    alignment: end;
+                    TermButton {
+                        text: "ATTEST";
+                        primary: true;
+                        enabled: root.notary != "" && root.attest-input != "" && !root.busy;
+                        clicked => {
+                            root.attest(root.attest-kind, root.attest-input);
+                        }
+                    }
+                }
+            }
+
+            Rectangle {
+                vertical-stretch: 1;
+            }
+        }
+
         if root.status != "": DotsH { }
 
         if root.status != "": Text {
@@ -1017,7 +1754,7 @@ export component AppWindow inherits Window {
 
                 Text {
                     color: Palette.dim;
-                    text: "PASTE THE TICKET OF A K5 YOU KEYSIGNED";
+                    text: "PASTE THE TICKET OF THE K5 TO PAIR WITH";
                     font-size: 20px;
                     wrap: word-wrap;
                 }
@@ -1027,7 +1764,7 @@ export component AppWindow inherits Window {
                     border-width: 2px;
                     border-color: Palette.ink;
                     clip: true;
-                    ticket := TextInput {
+                    ticket := TermInput {
                         x: 10px;
                         y: 8px;
                         width: parent.width - 20px;
@@ -1035,9 +1772,6 @@ export component AppWindow inherits Window {
                         single-line: false;
                         wrap: char-wrap;
                         font-size: 20px;
-                        color: Palette.text;
-                        selection-background-color: Palette.paper-hi;
-                        selection-foreground-color: Palette.text;
                         init => {
                             self.focus();
                         }
@@ -1061,6 +1795,115 @@ export component AppWindow inherits Window {
                         clicked => {
                             root.connect-ticket(ticket.text);
                             root.connecting = false;
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    // Pairing dialog: a k5 met by ticket and the check phrase, the same on
+    // both sides, to compare before keysigning it.
+    if root.pairing: Rectangle {
+        background: Palette.shade;
+        TouchArea { }
+
+        Rectangle {
+            width: parent.width - 32px;
+            height: pairing-layout.preferred-height;
+            background: Palette.paper;
+            border-width: 3px;
+            border-color: Palette.ink;
+            pairing-layout := VerticalLayout {
+                padding: 18px;
+                spacing: 12px;
+                Text {
+                    color: Palette.text;
+                    text: "PAIRED";
+                    font-family: "Doto";
+                    font-weight: 900;
+                    font-size: 32px;
+                }
+
+                Text {
+                    color: Palette.text;
+                    text: root.pair-who;
+                    font-size: 22px;
+                    wrap: word-wrap;
+                }
+
+                Text {
+                    color: Palette.dim;
+                    text: "CHECK PHRASE";
+                    font-size: 18px;
+                }
+
+                Rectangle {
+                    border-width: 2px;
+                    border-color: Palette.ink;
+                    background: Palette.paper-hi;
+                    Text {
+                        x: 10px;
+                        width: parent.width - 20px;
+                        color: Palette.text;
+                        text: root.pair-phrase;
+                        font-size: 30px;
+                        wrap: word-wrap;
+                    }
+                    height: 56px;
+                }
+
+                Text {
+                    color: Palette.dim;
+                    text: root.pair-trusted ? "ALREADY ON YOUR WEB OF TRUST. COMPARE IT WITH THEIR PHRASE: IF IT DIFFERS, SOMEONE IS IN THE MIDDLE." : "READ IT TO THEM. IF THEIR PHRASE IS THE SAME, KEYSIGN THEM WITH THEIR NAME; IF NOT, CLOSE.";
+                    font-size: 20px;
+                    wrap: word-wrap;
+                }
+
+                if !root.pair-trusted: Rectangle {
+                    height: 44px;
+                    border-width: 2px;
+                    border-color: Palette.ink;
+                    clip: true;
+                    TermInput {
+                        x: 10px;
+                        width: parent.width - 20px;
+                        height: parent.height;
+                        text <=> root.pair-name;
+                        font-size: 24px;
+                        vertical-alignment: center;
+                        init => {
+                            self.focus();
+                        }
+                    }
+
+                    if root.pair-name == "": Text {
+                        x: 10px;
+                        height: parent.height;
+                        vertical-alignment: center;
+                        text: "THEIR NAME";
+                        font-size: 24px;
+                        color: Palette.dim;
+                    }
+                }
+
+                HorizontalLayout {
+                    alignment: end;
+                    spacing: 12px;
+                    TermButton {
+                        text: "CLOSE";
+                        clicked => {
+                            root.pairing = false;
+                        }
+                    }
+
+                    if !root.pair-trusted: TermButton {
+                        text: "KEYSIGN";
+                        primary: true;
+                        enabled: root.pair-name != "" && !root.busy;
+                        clicked => {
+                            root.keysign(root.pair-k5, root.pair-name);
+                            root.pairing = false;
                         }
                     }
                 }

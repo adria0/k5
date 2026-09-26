@@ -16,6 +16,7 @@
 // rotation). As in `keysignparty`, the `# info` section is for humans only;
 // the statement must be signed by the k5 it names.
 
+use anyhow::{anyhow, Context as _};
 use pgp::{
     composed::{Deserializable, DetachedSignature},
     crypto::hash::HashAlgorithm,
@@ -24,7 +25,7 @@ use pgp::{
 use rand::rngs::OsRng;
 
 use super::{me, Error, Profile};
-use crate::{db::Db, key::Keys, message::Keyring};
+use crate::{db::Db, k5id::K5Id, key::Keys, message::Keyring};
 
 /// Type of iroh attestation records.
 pub const RECORD_TYPE: &str = "iroh";
@@ -94,26 +95,29 @@ pub fn create(keys: &Keys, endpoint: &str) -> Result<String, Error> {
 pub fn verify(record: &str, keyring: &Keyring) -> Result<Iroh, Error> {
     let (_, rest) = record
         .split_once("\n# statement\n")
-        .ok_or("iroh record has no `# statement` section")?;
+        .context("iroh record has no `# statement` section")?;
     let (statement, signature) = rest
         .rsplit_once("\n# signature\n")
-        .ok_or("iroh record has no `# signature` section")?;
+        .context("iroh record has no `# signature` section")?;
 
     let (signature, _) = DetachedSignature::from_string(signature)?;
     let signer = signature
         .signature
         .issuer_fingerprint()
         .first()
-        .ok_or("signature has no issuer fingerprint")?
+        .context("signature has no issuer fingerprint")?
         .to_string();
     let signer_key = keyring
         .get(&signer)
-        .ok_or_else(|| format!("unknown signer k5:{signer}: fetch its self attestation first"))?;
+        .with_context(|| format!("unknown signer k5:{signer}: fetch its self attestation first"))?;
     signature.verify(signer_key, statement.as_bytes())?;
 
     let iroh = parse_statement(statement)?;
     if iroh.k5 != signer {
-        return Err(format!("iroh record of k5:{} signed by k5:{signer}", iroh.k5).into());
+        return Err(anyhow!(
+            "iroh record of k5:{} signed by k5:{signer}",
+            iroh.k5
+        ));
     }
 
     Ok(iroh)
@@ -142,22 +146,21 @@ pub async fn ensure(db: &dyn Db, keys: &Keys, endpoint: &str) -> Result<Option<S
 
 /// The iroh attestation of `k5` in `db`, verified against the self
 /// attestation of `k5` in `db`. `None` if either is missing.
-pub async fn lookup(db: &dyn Db, k5: &str) -> Result<Option<Iroh>, Error> {
-    let k5 = k5
-        .trim()
-        .strip_prefix("k5:")
-        .unwrap_or(k5.trim())
-        .to_ascii_lowercase();
-    let Some(record) = db.get(&name(&k5)).await? else {
+pub async fn lookup(db: &dyn Db, k5: &K5Id) -> Result<Option<Iroh>, Error> {
+    let Some(record) = db.get(&name(k5)).await? else {
         return Ok(None);
     };
-    let Some(me) = me::lookup(db, &k5).await? else {
+    let Some(me) = me::lookup(db, k5).await? else {
         return Ok(None);
     };
 
     let iroh = verify(&record, &Keyring::from([(me.k5, me.public)]))?;
-    if iroh.k5 != k5 {
-        return Err(format!("{} is the iroh attestation of k5:{}", name(&k5), iroh.k5).into());
+    if iroh.k5 != k5.as_str() {
+        return Err(anyhow!(
+            "{} is the iroh attestation of k5:{}",
+            name(k5),
+            iroh.k5
+        ));
     }
 
     Ok(Some(iroh))
@@ -187,20 +190,20 @@ fn parse_statement(statement: &str) -> Result<Iroh, Error> {
         lines
             .next()
             .and_then(|line| line.strip_prefix(prefix))
-            .ok_or_else(|| format!("invalid iroh statement: expected `{prefix}`"))
+            .ok_or_else(|| anyhow!("invalid iroh statement: expected `{prefix}`"))
     };
 
     field(STATEMENT_HEADER)?
         .is_empty()
         .then_some(())
-        .ok_or("invalid iroh statement header")?;
-    let k5 = parse_hex32(field("k5:")?, "k5")?;
+        .context("invalid iroh statement header")?;
+    let k5 = K5Id::parse_strict(field("k5:")?)?.into();
     let endpoint = parse_endpoint(field("endpoint:")?)?;
     let date = field("date:")?.to_string();
     chrono::DateTime::parse_from_rfc3339(&date)
-        .map_err(|e| format!("invalid iroh statement date `{date}`: {e}"))?;
+        .map_err(|e| anyhow!("invalid iroh statement date `{date}`: {e}"))?;
     if lines.next().is_some() {
-        return Err("invalid iroh statement: unexpected content".into());
+        return Err(anyhow!("invalid iroh statement: unexpected content"));
     }
 
     Ok(Iroh { k5, endpoint, date })
@@ -214,7 +217,9 @@ pub fn parse_endpoint(endpoint: &str) -> Result<String, Error> {
 fn parse_hex32(value: &str, what: &str) -> Result<String, Error> {
     let value = value.trim();
     if value.len() != 64 || !value.bytes().all(|b| b.is_ascii_hexdigit()) {
-        return Err(format!("invalid {what} `{value}`: expected 64 hex characters").into());
+        return Err(anyhow!(
+            "invalid {what} `{value}`: expected 64 hex characters"
+        ));
     }
 
     Ok(value.to_ascii_lowercase())

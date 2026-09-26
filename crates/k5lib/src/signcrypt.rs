@@ -16,6 +16,7 @@
 // binds the recipient into what was signed, so the message cannot be
 // re-encrypted to someone else as if sent to them.
 
+use anyhow::{anyhow, Context as _};
 use pgp::{
     composed::{Message, MessageBuilder, SignedPublicSubKey},
     crypto::{hash::HashAlgorithm, sym::SymmetricKeyAlgorithm},
@@ -26,6 +27,7 @@ use rand::rngs::OsRng;
 use crate::{
     attestations::{me, Error},
     db::Db,
+    k5id::K5Id,
     key::Keys,
     message::Keyring,
 };
@@ -39,37 +41,28 @@ pub struct Opened {
     pub msg: String,
 }
 
-/// Normalizes a k5 given on the command line: without the `k5:`
-/// prefix, lowercase.
-pub fn recipient_k5(k5: &str) -> String {
-    let k5 = k5.trim();
-    k5.strip_prefix("k5:").unwrap_or(k5).to_ascii_lowercase()
-}
-
 /// Returns the `MlKem768X25519` encryption subkey of `k5` from its self
 /// attestation in `db`, which must be valid.
-pub async fn recipient_encryption_key(db: &dyn Db, k5: &str) -> Result<SignedPublicSubKey, Error> {
-    let k5 = recipient_k5(k5);
-    let name = me::name(&k5);
+pub async fn recipient_encryption_key(db: &dyn Db, k5: &K5Id) -> Result<SignedPublicSubKey, Error> {
+    let name = me::name(k5);
     let path = db.location(&name);
 
     let Some(record) = db.get(&name).await? else {
-        return Err(format!(
+        return Err(anyhow!(
             "no self attestation of k5:{k5} ({path}): its encryption key is unknown"
-        )
-        .into());
+        ));
     };
 
-    let me = me::verify(&record).map_err(|e| format!("invalid self attestation {path}: {e}"))?;
-    if me.k5 != k5 {
-        return Err(format!("{path} is the self attestation of k5:{}", me.k5).into());
+    let me = me::verify(&record).map_err(|e| anyhow!("invalid self attestation {path}: {e}"))?;
+    if me.k5 != k5.as_str() {
+        return Err(anyhow!("{path} is the self attestation of k5:{}", me.k5));
     }
 
     me.public
         .public_subkeys
         .into_iter()
         .next()
-        .ok_or_else(|| format!("{path} has no encryption subkey").into())
+        .ok_or_else(|| anyhow!("{path} has no encryption subkey"))
 }
 
 /// Signs `msg` with `keys` and encrypts it to `to_key`, addressed to `to`.
@@ -99,19 +92,19 @@ pub fn open(keys: &Keys, armored: &str, keyring: &Keyring) -> Result<Opened, Err
     let (msg, _) = Message::from_armor(armored.as_bytes())?;
     let mut msg = msg
         .decrypt(&Password::empty(), &keys.secret)
-        .map_err(|_| "decryption failed: not encrypted to this key, or tampered")?;
+        .map_err(|_| anyhow!("decryption failed: not encrypted to this key, or tampered"))?;
 
     let plaintext = msg
         .as_data_string()
-        .map_err(|_| "decryption failed: not encrypted to this key, or tampered")?;
+        .map_err(|_| anyhow!("decryption failed: not encrypted to this key, or tampered"))?;
     let (from, to, body) = parse_statement(&plaintext)?;
     if to != keys.k5() {
-        return Err(format!("message is for k5:{to}, not for k5:{}", keys.k5()).into());
+        return Err(anyhow!("message is for k5:{to}, not for k5:{}", keys.k5()));
     }
 
     let sender = keyring
         .get(&from)
-        .ok_or_else(|| format!("unknown sender k5:{from}: fetch its self attestation first"))?;
+        .with_context(|| format!("unknown sender k5:{from}: fetch its self attestation first"))?;
     msg.verify(sender)?;
 
     Ok(Opened { from, msg: body })
@@ -125,14 +118,17 @@ pub fn open_own(keys: &Keys, armored: &str) -> Result<(String, String), Error> {
     let (msg, _) = Message::from_armor(armored.as_bytes())?;
     let mut msg = msg
         .decrypt(&Password::empty(), &keys.secret)
-        .map_err(|_| "decryption failed: not encrypted to this key, or tampered")?;
+        .map_err(|_| anyhow!("decryption failed: not encrypted to this key, or tampered"))?;
 
     let plaintext = msg
         .as_data_string()
-        .map_err(|_| "decryption failed: not encrypted to this key, or tampered")?;
+        .map_err(|_| anyhow!("decryption failed: not encrypted to this key, or tampered"))?;
     let (from, to, body) = parse_statement(&plaintext)?;
     if from != keys.k5() {
-        return Err(format!("sent copy from k5:{from}, not from k5:{}", keys.k5()).into());
+        return Err(anyhow!(
+            "sent copy from k5:{from}, not from k5:{}",
+            keys.k5()
+        ));
     }
     msg.verify(&keys.public())?;
 
@@ -147,27 +143,25 @@ fn statement(from: &str, to: &str, msg: &str) -> String {
 fn parse_statement(statement: &str) -> Result<(String, String, String), Error> {
     let rest = statement
         .strip_prefix(&format!("{HEADER}\n"))
-        .ok_or("not a signcrypt statement")?;
+        .context("not a signcrypt statement")?;
     let (from, rest) = rest
         .split_once('\n')
-        .ok_or("invalid signcrypt statement: missing `to:`")?;
+        .context("invalid signcrypt statement: missing `to:`")?;
     let from = from
         .strip_prefix("from:")
-        .ok_or("invalid signcrypt statement: expected `from:`")?;
+        .context("invalid signcrypt statement: expected `from:`")?;
     let (to, msg) = rest
         .split_once('\n')
-        .ok_or("invalid signcrypt statement: missing message")?;
+        .context("invalid signcrypt statement: missing message")?;
     let to = to
         .strip_prefix("to:")
-        .ok_or("invalid signcrypt statement: expected `to:`")?;
+        .context("invalid signcrypt statement: expected `to:`")?;
 
-    let check_k5 = |k5: &str| {
-        (k5.len() == 64 && k5.bytes().all(|b| b.is_ascii_hexdigit()))
-            .then(|| k5.to_ascii_lowercase())
-            .ok_or_else(|| Error::from(format!("invalid k5 `{k5}`")))
-    };
-
-    Ok((check_k5(from)?, check_k5(to)?, msg.to_string()))
+    Ok((
+        K5Id::parse_strict(from)?.into(),
+        K5Id::parse_strict(to)?.into(),
+        msg.to_string(),
+    ))
 }
 
 #[cfg(test)]

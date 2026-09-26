@@ -12,9 +12,12 @@ pub mod api;
 pub mod attestations;
 pub mod db;
 pub mod graph;
+pub mod k5id;
 pub mod key;
 pub mod message;
 pub mod parallel;
 pub mod signcrypt;
 
-pub type Error = Box<dyn std::error::Error>;
+/// The error of every fallible operation: any error, with the chain of its
+/// causes. `Send + Sync`, so it crosses tasks and threads.
+pub type Error = anyhow::Error;

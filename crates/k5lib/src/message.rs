@@ -8,13 +8,14 @@
 
 use std::collections::HashMap;
 
+use anyhow::Context as _;
 use pgp::{
     composed::{CleartextSignedMessage, SignedPublicKey, SignedSecretKey},
     types::Password,
 };
 use rand::rngs::OsRng;
 
-pub type Error = Box<dyn std::error::Error>;
+pub use crate::Error;
 
 /// Public keys of known signers, by k5 id (OpenPGP fingerprint).
 pub type Keyring = HashMap<String, SignedPublicKey>;
@@ -40,16 +41,16 @@ pub fn verify(armored: &str, keyring: &Keyring) -> Result<Verified, Error> {
     let signature = signed
         .signatures()
         .first()
-        .ok_or("signed message has no signature")?;
+        .context("signed message has no signature")?;
     let from = signature
         .issuer_fingerprint()
         .first()
-        .ok_or("signature has no issuer fingerprint")?
+        .context("signature has no issuer fingerprint")?
         .to_string();
 
     let public = keyring
         .get(&from)
-        .ok_or_else(|| format!("unknown signer k5:{from}: fetch its self attestation first"))?;
+        .with_context(|| format!("unknown signer k5:{from}: fetch its self attestation first"))?;
     signed.verify(public)?;
 
     // `signed_text` normalizes line endings to CRLF for hashing; every

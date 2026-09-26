@@ -8,6 +8,7 @@
 
 use std::{path::PathBuf, time::Duration};
 
+use anyhow::anyhow;
 use k256::{ecdsa::SigningKey, pkcs8::DecodePrivateKey};
 use notary_server::{NotarizationProperties, NotaryServerProperties};
 use tokio::task::JoinHandle;
@@ -84,7 +85,9 @@ pub async fn start(max_sent: usize, max_recv: usize) -> Result<LocalNotary, Erro
     while tokio::net::TcpStream::connect((HOST, port)).await.is_err() {
         attempts += 1;
         if local.server.is_finished() || attempts > 100 {
-            return Err(format!("local notary server did not start on {HOST}:{port}").into());
+            return Err(anyhow!(
+                "local notary server did not start on {HOST}:{port}"
+            ));
         }
         tokio::time::sleep(Duration::from_millis(50)).await;
     }
@@ -95,7 +98,7 @@ pub async fn start(max_sent: usize, max_recv: usize) -> Result<LocalNotary, Erro
 /// Public key of the embedded signing key (compressed, hex).
 fn public_key_hex() -> Result<String, Error> {
     let key = SigningKey::from_pkcs8_pem(KEY_PEM)
-        .map_err(|err| format!("invalid embedded local notary key: {err}"))?;
+        .map_err(|err| anyhow!("invalid embedded local notary key: {err}"))?;
 
     Ok(hex::encode(
         key.verifying_key().to_encoded_point(true).as_bytes(),

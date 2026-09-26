@@ -16,6 +16,7 @@
 // from a [`Keyring`] by the fingerprint carried in the signature, as a real
 // PGP keyring would. The trust in the attestation is the trust in its signer.
 
+use anyhow::{anyhow, Context as _};
 use pgp::{
     composed::{Deserializable, DetachedSignature},
     crypto::hash::HashAlgorithm,
@@ -24,7 +25,7 @@ use pgp::{
 use rand::rngs::OsRng;
 
 use super::{Error, Profile};
-use crate::{db::Db, key::Keys, message::Keyring};
+use crate::{db::Db, k5id::K5Id, key::Keys, message::Keyring};
 
 /// Type of key sign party attestation records.
 pub const RECORD_TYPE: &str = "keysignparty";
@@ -61,11 +62,11 @@ pub fn create(
     name: &str,
     fake: bool,
 ) -> Result<(String, String), Error> {
-    let subject = parse_k5(subject)?;
+    let subject = String::from(K5Id::parse(subject)?);
     check_name(name)?;
     let signer = keys.k5();
     if subject == signer {
-        return Err("you cannot attest your own k5".into());
+        return Err(anyhow!("you cannot attest your own k5"));
     }
 
     let date = chrono::Utc::now().to_rfc3339_opts(chrono::SecondsFormat::Secs, true);
@@ -138,26 +139,26 @@ pub async fn attest(
 pub fn verify(record: &str, keyring: &Keyring) -> Result<KeySign, Error> {
     let (_, rest) = record
         .split_once("\n# statement\n")
-        .ok_or("keysignparty record has no `# statement` section")?;
+        .context("keysignparty record has no `# statement` section")?;
     let (statement, signature) = rest
         .rsplit_once("\n# signature\n")
-        .ok_or("keysignparty record has no `# signature` section")?;
+        .context("keysignparty record has no `# signature` section")?;
 
     let (signature, _) = DetachedSignature::from_string(signature)?;
     let signer = signature
         .signature
         .issuer_fingerprint()
         .first()
-        .ok_or("signature has no issuer fingerprint")?
+        .context("signature has no issuer fingerprint")?
         .to_string();
     let signer_key = keyring
         .get(&signer)
-        .ok_or_else(|| format!("unknown signer k5:{signer}: fetch its self attestation first"))?;
+        .with_context(|| format!("unknown signer k5:{signer}: fetch its self attestation first"))?;
     signature.verify(signer_key, statement.as_bytes())?;
 
     let keysign = parse_statement(statement, signer)?;
     if keysign.subject == keysign.signer {
-        return Err("self-attestation".into());
+        return Err(anyhow!("self-attestation"));
     }
 
     Ok(keysign)
@@ -174,23 +175,29 @@ fn parse_statement(statement: &str, signer: String) -> Result<KeySign, Error> {
         lines
             .next()
             .and_then(|line| line.strip_prefix(prefix))
-            .ok_or_else(|| format!("invalid keysignparty statement: expected `{prefix}`"))
+            .ok_or_else(|| anyhow!("invalid keysignparty statement: expected `{prefix}`"))
     };
 
     field(STATEMENT_HEADER)?
         .is_empty()
         .then_some(())
-        .ok_or("invalid keysignparty statement header")?;
-    let subject = parse_k5(field("k5:")?)?;
+        .context("invalid keysignparty statement header")?;
+    let subject = K5Id::parse_strict(field("k5:")?)?.into();
     let name = field("name:")?.to_string();
     let date = field("date:")?.to_string();
     let fake = match lines.next() {
         None => false,
         Some("fake:true") => true,
-        Some(_) => return Err("invalid keysignparty statement: unexpected content".into()),
+        Some(_) => {
+            return Err(anyhow!(
+                "invalid keysignparty statement: unexpected content"
+            ))
+        }
     };
     if lines.next().is_some() {
-        return Err("invalid keysignparty statement: unexpected content".into());
+        return Err(anyhow!(
+            "invalid keysignparty statement: unexpected content"
+        ));
     }
     check_name(&name)?;
 
@@ -203,20 +210,9 @@ fn parse_statement(statement: &str, signer: String) -> Result<KeySign, Error> {
     })
 }
 
-/// Parses a k5 id, with or without the `k5:` prefix.
-fn parse_k5(k5: &str) -> Result<String, Error> {
-    let k5 = k5.trim();
-    let k5 = k5.strip_prefix("k5:").unwrap_or(k5);
-    if k5.len() != 64 || !k5.bytes().all(|b| b.is_ascii_hexdigit()) {
-        return Err(format!("invalid k5 `{k5}`: expected 64 hex characters").into());
-    }
-
-    Ok(k5.to_ascii_lowercase())
-}
-
 fn check_name(name: &str) -> Result<(), Error> {
     if name.trim().is_empty() || name.trim() != name || name.chars().any(char::is_control) {
-        return Err(format!("invalid name `{name}`").into());
+        return Err(anyhow!("invalid name `{name}`"));
     }
 
     Ok(())

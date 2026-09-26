@@ -12,6 +12,7 @@ mod github;
 mod site;
 mod x;
 
+use anyhow::{anyhow, Context as _};
 use hyper::Uri;
 
 pub use crate::attestations::{Error, Profile};
@@ -58,10 +59,10 @@ impl Session<'_> {
         let (head, body) = self
             .recv
             .split_once("\r\n\r\n")
-            .ok_or("response has no body")?;
+            .context("response has no body")?;
         let status = head.lines().next().unwrap_or_default();
         if status.split(' ').nth(1) != Some("200") {
-            return Err(format!("unexpected response status: {status}").into());
+            return Err(anyhow!("unexpected response status: {status}"));
         }
 
         Ok(body)
@@ -73,7 +74,7 @@ pub fn target(url: &str) -> Result<Target, Error> {
     let uri: Uri = url.parse()?;
 
     if uri.scheme_str() != Some("https") {
-        return Err(format!("only https URLs are supported: `{url}`").into());
+        return Err(anyhow!("only https URLs are supported: `{url}`"));
     }
 
     if let Some(target) = PLUGINS.iter().find_map(|plugin| plugin.target(&uri)) {
@@ -82,7 +83,7 @@ pub fn target(url: &str) -> Result<Target, Error> {
 
     let host = uri
         .host()
-        .ok_or_else(|| format!("URL has no host: `{url}`"))?;
+        .with_context(|| format!("URL has no host: `{url}`"))?;
 
     Ok(Target {
         host: host.to_string(),
