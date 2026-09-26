@@ -1,94 +1,190 @@
-<p align="center">
-    <img src="./tlsn-banner.png" width=1280 />
-</p>
+# k5
 
-![MIT licensed][mit-badge]
-![Apache licensed][apache-badge]
-[![Build Status][actions-badge]][actions-url]
+**A web of trust for online identities, with post-quantum keys.**
 
-[mit-badge]: https://img.shields.io/badge/license-MIT-blue.svg
-[apache-badge]: https://img.shields.io/github/license/saltstack/salt
-[actions-badge]: https://github.com/tlsnotary/tlsn/actions/workflows/ci.yml/badge.svg?branch=dev
-[actions-url]: https://github.com/tlsnotary/tlsn/actions?query=workflow%3Aci+branch%3Adev
+Your identity in k5 is your *k5*: the fingerprint of an OpenPGP v6 key with a
+post-quantum composite `MlDsa65Ed25519` signing key and an `MlKem768X25519`
+encryption subkey. Around it you collect **attestations** that link the k5 to
+the rest of your online life, share them with people you trust, and talk to
+them privately:
 
-[Website](https://tlsnotary.org) |
-[Documentation](https://docs.tlsnotary.org) |
-[API Docs](https://tlsnotary.github.io/tlsn) |
-[Discord](https://discord.gg/9XwESXtcN7)
+- **Profiles, proven with TLSNotary**: notarize a tweet, a GitHub gist or a
+  `k5.txt` on your website that contains your k5. The attestation proves the
+  server really returned it, without trusting you.
+- **Keysigns**: as in a PGP key signing party, attest that you know the owner
+  of a k5. Keysigns form the web of trust: the k5s reachable from yours.
+- **Messages**: sign, or sign and encrypt (signcrypt) to a k5, with its
+  published post-quantum key.
+- **Peer to peer**: deliver messages and merge each other's attestations
+  directly, over [iroh](https://www.iroh.computer), with anyone on your web of
+  trust.
 
-# TLSNotary
+> [!WARNING]
+> k5 is experimental. It relies on rpgp's `draft-pqc` implementation of
+> draft-ietf-openpgp-pqc, which is not stable yet: formats may change. Do not
+> use it for anything that matters.
 
-**Data provenance and privacy with secure multi-party computation**
+## Quick start
 
-## ⚠️ Notice
+```sh
+cargo build --release -p k5cli -p k5gui
 
-This project is currently under active development and should not be used in production. Expect bugs and regular major breaking changes.
+k5cli init                    # create k5.toml with your keys
+k5cli me                      # print your k5
+k5cli attest new https://x.com/<you>/status/<id>   # a tweet containing your k5
+k5cli attest list             # verify and list the attestations
+k5gui                         # the desktop interface
+```
+
+`k5cli.sh` and `k5gui.sh` run them through `cargo run --release`. `k5-test.sh`
+is an end-to-end run of most commands (it deletes `db/` first).
+
+## Attestations
+
+Everything lives next to where you run the tools:
+
+- `k5.toml`: your keys (and, once online, your iroh key). Keep it private.
+- `db/attestations/`: the attestations, one markdown record per file, named
+  after the k5 they are about. They are verified every time they are read.
+- `db/inbox/`: messages received peer to peer, still encrypted.
+
+Record types:
+
+| Type               | What it proves                                                     |
+|--------------------|--------------------------------------------------------------------|
+| `tlsn`             | a TLSNotary-notarized session: a profile on X, GitHub or a website |
+| `keysignparty`     | a k5 attests it knows the owner of another k5                      |
+| `self_attestation` | a k5 publishes its public keys (created automatically)             |
+| `iroh`             | the iroh endpoint a k5 can be reached at (created when online)     |
+
+Supported profiles (`k5cli attest new <url>`):
+
+- **X**: `https://x.com/<user>/status/<id>`, a tweet containing your k5.
+- **GitHub**: `https://gist.githubusercontent.com/<user>/<id>/raw/...`, a
+  gist containing your k5.
+- **Website**: `https://<domain>/k5.txt` containing `k5:<your k5>`.
+
+Without `--notary-host`, `attest new` runs a notary in-process, signing with
+the key embedded in k5cli (`crates/k5cli/local-notary.pem`), which is also the
+default key attestations are verified against (`--notary-key`). Since that key
+is public, the default setup is for development: anyone can sign as that
+notary.
+
+### Sharing
+
+```sh
+k5cli attest keysign k5:<their k5> "Their Name"
+k5cli attest export            # export.md: your attestations, signed
+k5cli attest merge export.md   # merge someone's export
+```
+
+A merge only takes what is on your web of trust: keysigns whose signer you can
+reach through keysigns, and other attestations about k5s you can reach.
+
+## Messages
+
+```sh
+k5cli msg sign "hello"
+k5cli msg signcrypt k5:<their k5> "hello, privately"
+k5cli msg verify msg.md
+```
+
+Signcrypting needs the recipient's self attestation in your database.
+
+## Peer to peer
+
+k5s talk directly over iroh, addressed by public key. A k5 cannot be dialed by
+its id (a fingerprint), so each k5 has its own iroh key, in the `[iroh]`
+section of `k5.toml`, and publishes its endpoint in an `iroh` attestation
+signed with the k5 key. Those records travel with the others through export,
+merge and sync, so the web of trust is how k5s find each other; n0's address
+lookup and relays find the way to the endpoint. On every connection both sides
+prove their k5 and check the other is on their web of trust.
+
+First contact, after keysigning each other:
+
+```sh
+# Alice
+k5cli p2p listen               # prints a ticket, serves until Ctrl-C
+# Bob
+k5cli p2p connect k5ticket:... # both learn how to reach each other
+```
+
+From then on, by k5:
+
+```sh
+k5cli p2p send k5:<alice> "hi"  # sign, encrypt and deliver
+k5cli p2p sync k5:<alice>       # merge Alice's attestations
+k5cli p2p inbox                 # read the messages received
+```
+
+Both peers must be online: messages are not stored and forwarded. n0's
+servers see endpoint ids and IP addresses, never k5s or message content.
+
+## Desktop interface
+
+`k5gui` searches the attestations, shows the dossier of an identity (profiles,
+trust path), sends it messages, syncs with it, and shows the inbox. It goes
+online at start; `TICKET` and `CONNECT` handle the first contact.
+
+```sh
+k5gui [--config k5.toml] [--db db] [--offline]
+```
+
+To try two clients on one machine: `k5gui --config a.toml --db a/` and
+`k5gui --config b.toml --db b/`.
+
+## Tools
+
+```sh
+k5cli fakegraph 50             # a deterministic fake social graph, for testing
+k5cli makedot                  # graph.dot: the web of trust, for Graphviz
+```
+
+### zk-email proofs
+
+`k5cli` can generate a Plonky2 proof for a supported DKIM-signed `.eml` file.
+Pass a trusted DKIM JSON record with `domain`, `selector` and `record` fields;
+the proof is written to `--output`. It must run in release mode, otherwise the
+prover is too slow:
+
+```sh
+cargo +nightly-2025-07-02 run --release -p k5cli --features zkemail -- \
+  zkemail path/to/message.eml path/to/dkim.json --output email.proof
+```
+
+## Crates
+
+- [`k5lib`](./crates/k5lib/): the k5 library: keys, attestations, messages,
+  the database (`Db` trait, `FsDb`).
+- [`k5net`](./crates/k5net/): peer to peer over iroh.
+- [`k5cli`](./crates/k5cli/): the command line, with the in-process notary.
+- [`k5gui`](./crates/k5gui/): the desktop interface (Slint).
+
+The other crates are the TLSNotary implementation k5 builds on, and
+`vendor/mpz-core` a patched copy of one of its dependencies (see its README).
+
+## Building
+
+If the build fails with:
+
+```
+Could not find directory of OpenSSL installation, and this `-sys` crate cannot
+  proceed without this knowledge.
+```
+
+install the OpenSSL development packages (`libssl-dev` on Ubuntu,
+`openssl-devel` on Fedora).
 
 ## License
-All crates in this repository are licensed under either of
+
+Licensed under either of
 
 - [Apache License, Version 2.0](http://www.apache.org/licenses/LICENSE-2.0)
 - [MIT license](http://opensource.org/licenses/MIT)
 
 at your option.
 
-## Branches
-
-- [`main`](https://github.com/tlsnotary/tlsn/tree/main)
-  - Default branch — points to the latest release.
-  - This is stable and suitable for most users.
-- [`dev`](https://github.com/tlsnotary/tlsn/tree/dev)
-  - Development branch — contains the latest PRs.
-  - Developers should submit their PRs against this branch.
-
-## Directory
-
-- [examples](./crates/examples/): Examples on how to use the TLSNotary protocol.
-- [tlsn-prover](./crates/prover/): The library for the prover component.
-- [tlsn-verifier](./crates/verifier/): The library for the verifier component.
-- [notary](./crates/notary/): Implements the [notary server](https://docs.tlsnotary.org/intro.html#tls-verification-with-a-general-purpose-notary) and its client.
-- [components](./crates/components/): Houses low-level libraries.
-
-This repository contains the source code for the Rust implementation of the TLSNotary protocol. For additional tools and implementations related to TLSNotary, visit <https://github.com/tlsnotary>. This includes repositories such as [`tlsn-js`](https://github.com/tlsnotary/tlsn-js), [`tlsn-extension`](https://github.com/tlsnotary/tlsn-extension), [`explorer`](https://github.com/tlsnotary/explorer), among others.
-
-
-## Development
-
-### zk-email proof generation
-
-The `aiwot` CLI can generate a Plonky2 proof for a supported DKIM-signed
-`.eml` file. Pass a trusted DKIM JSON record containing `domain`, `selector`,
-and `record` fields; the CLI writes the serialized proof to `--output`:
-
-```sh
-cargo +nightly-2025-07-02 run --release -p aiwot --features zkemail -- \
-  zkemail path/to/message.eml path/to/dkim.json --output email.proof
-```
-
-The CLI must be run with `--release`; without release mode, the prover is too
-slow.
-
-> [!IMPORTANT]
-> **Note on Rust-to-WASM Compilation**: This project requires compiling Rust into WASM, which needs [`clang`](https://clang.llvm.org/) version 16.0.0 or newer. MacOS users, be aware that Xcode's default `clang` might be older. If you encounter the error `No available targets are compatible with triple "wasm32-unknown-unknown"`, it's likely due to an outdated `clang`. Updating `clang` to a newer version should resolve this issue.
-> 
-> For MacOS aarch64 users, if Apple's default `clang` isn't working, try installing `llvm` via Homebrew (`brew install llvm`). You can then prioritize the Homebrew `clang` over the default macOS version by modifying your `PATH`. Add the following line to your shell configuration file (e.g., `.bashrc`, `.zshrc`):
-> ```sh
-> export PATH="/opt/homebrew/opt/llvm/bin:$PATH"
-> ```
-
-If you run into this error:
-```
-Could not find directory of OpenSSL installation, and this `-sys` crate cannot
-  proceed without this knowledge. If OpenSSL is installed and this crate had
-  trouble finding it,  you can set the `OPENSSL_DIR` environment variable for the
-  compilation process.
-```
-Make sure you have the development packages of OpenSSL installed (`libssl-dev` on Ubuntu or `openssl-devel` on Fedora).
-
-## Contribution
-
 Unless you explicitly state otherwise, any contribution intentionally submitted
 for inclusion in the work by you, as defined in the Apache-2.0 license, shall be
 dual licensed as above, without any additional terms or conditions.
-
-See [CONTRIBUTING.md](CONTRIBUTING.md).

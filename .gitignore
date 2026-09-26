@@ -31,3 +31,8 @@ target/
 *.csv
 db
 msg.md
+export.md
+graph.dot
+outbox
+presentation.tlsn
+p2p-test

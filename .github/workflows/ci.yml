@@ -43,10 +43,10 @@ jobs:
         uses: Swatinem/rust-cache@v2.7.7
 
       - name: Clippy
-        run: cargo clippy --workspace --exclude k5 --keep-going --all-features --all-targets --locked -- -D warnings
+        run: cargo clippy --workspace --exclude k5lib --exclude k5cli --exclude k5gui --exclude k5net --keep-going --all-features --all-targets --locked -- -D warnings
 
       - name: Clippy k5 without zk-email
-        run: cargo clippy -p k5 --all-targets --locked -- -D warnings
+        run: cargo clippy -p k5lib -p k5cli -p k5gui -p k5net --all-targets --locked -- -D warnings
 
   fmt:
     name: Check formatting
@@ -180,9 +180,9 @@ jobs:
       - name: Install cargo-llvm-cov
         uses: taiki-e/install-action@cargo-llvm-cov
       - name: Generate code coverage
-        run: cargo llvm-cov --all-features --workspace --exclude k5 --locked --lcov --output-path lcov.info
+        run: cargo llvm-cov --all-features --workspace --exclude k5lib --exclude k5cli --exclude k5gui --exclude k5net --locked --lcov --output-path lcov.info
       - name: Generate k5 coverage without zk-email
-        run: cargo llvm-cov -p k5 --locked --lcov --output-path lcov-k5.info
+        run: cargo llvm-cov -p k5lib -p k5cli -p k5gui -p k5net --locked --lcov --output-path lcov-k5.info
       - name: Upload coverage to Codecov
         uses: codecov/codecov-action@v4
         with:

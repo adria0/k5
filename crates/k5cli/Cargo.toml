@@ -1,0 +1,37 @@
+[package]
+edition = "2021"
+name = "k5cli"
+description = "k5 command line, with an integrated notary server for attestations and peer-to-peer messages and sync"
+publish = false
+version = "0.1.0"
+
+[lints]
+workspace = true
+
+[[bin]]
+name = "k5cli"
+path = "src/main.rs"
+
+[features]
+zkemail = ["k5lib/zkemail"]
+
+[dependencies]
+k5lib = { path = "../k5lib" }
+# `k5cli p2p`: messages and sync with other k5s over iroh.
+k5net = { path = "../k5net" }
+# The integrated notary server, started when no notary host is given.
+notary-server = { workspace = true }
+k256 = { workspace = true, features = ["pkcs8", "pem"] }
+
+clap = { version = "4.5", features = ["derive"] }
+hex = { workspace = true }
+# Same `pgp` and `rand` 0.8 family as k5lib (see its Cargo.toml), for
+# `fakegraph` and `k256`'s `OsRng`.
+pgp = { version = "0.20", features = ["draft-pqc"] }
+rand = { version = "0.8" }
+rand_chacha = { version = "0.3" }
+sha2 = { workspace = true }
+toml = { workspace = true }
+tokio = { workspace = true, features = ["rt", "rt-multi-thread", "macros", "net", "fs", "time", "signal"] }
+tracing-subscriber = { workspace = true }
+

@@ -1,0 +1,45 @@
+[package]
+edition = "2021"
+name = "k5lib"
+description = "k5 library: notarize and verify k5 profiles with TLSNotary, and sign messages with an OpenPGP post-quantum key"
+publish = false
+version = "0.1.0"
+
+[lints]
+workspace = true
+
+[features]
+zkemail = ["dep:plonky2-zkemail"]
+
+[dependencies]
+async-trait = { workspace = true }
+notary-client = { workspace = true }
+tlsn-common = { workspace = true }
+tlsn-core = { workspace = true }
+tlsn-formats = { workspace = true }
+tlsn-prover = { workspace = true }
+spansy = { workspace = true }
+rangeset = { workspace = true }
+regex = { workspace = true }
+plonky2-zkemail = { path = "../plonky2-zkemail", optional = true }
+
+base64 = { version = "0.22" }
+bincode = { workspace = true }
+bs58 = { version = "0.5" }
+chrono = { workspace = true }
+hex = { workspace = true }
+http-body-util = { workspace = true }
+hyper = { workspace = true, features = ["client", "http1"] }
+hyper-util = { workspace = true, features = ["full"] }
+# `pgp` (rpgp) needs `rand` 0.8, incompatible with the workspace's `rand` 0.9
+# family used elsewhere; kept as crate-local dependencies, not
+# `{ workspace = true }`.
+pgp = { version = "0.20", features = ["draft-pqc"] }
+rand = { version = "0.8" }
+rand_chacha = { version = "0.3" }
+serde = { workspace = true, features = ["derive"] }
+serde_json = { workspace = true }
+sha2 = { workspace = true }
+tokio = { workspace = true, features = ["rt", "rt-multi-thread", "macros", "net", "fs"] }
+tokio-util = { workspace = true, features = ["compat"] }
+toml = { workspace = true }

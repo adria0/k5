@@ -1,0 +1,30 @@
+[package]
+edition = "2021"
+name = "k5gui"
+description = "k5 desktop interface: search the attestations, inspect identities, message them and sync with them peer to peer"
+publish = false
+version = "0.1.0"
+
+[lints]
+workspace = true
+
+[[bin]]
+name = "k5gui"
+path = "src/main.rs"
+
+[dependencies]
+k5lib = { path = "../k5lib" }
+k5net = { path = "../k5net" }
+
+arboard = { version = "3.6" }
+chrono = { workspace = true }
+clap = { version = "4.5", features = ["derive"] }
+slint = { version = "1.18" }
+tokio = { workspace = true, features = ["rt", "rt-multi-thread"] }
+
+[dev-dependencies]
+# Offscreen rendering, for the window snapshot test in `gui`.
+slint = { version = "1.18", features = ["renderer-software"] }
+
+[build-dependencies]
+slint-build = { version = "1.18" }
