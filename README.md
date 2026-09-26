@@ -60,6 +60,8 @@ Record types:
 | `keysignparty`     | a k5 attests it knows the owner of another k5                      |
 | `self_attestation` | a k5 publishes its public keys (created automatically)             |
 | `iroh`             | the iroh endpoint a k5 can be reached at (created when online)     |
+| `name`             | the name a k5 claims for itself (signed by that k5)                |
+| `zkemail`          | an email address: a zero-knowledge proof of a DKIM-signed email    |
 
 Supported profiles (`k5cli attest new <url>`):
 
@@ -67,6 +69,16 @@ Supported profiles (`k5cli attest new <url>`):
 - **GitHub**: `https://gist.githubusercontent.com/<user>/<id>/raw/...`, a
   gist containing your k5.
 - **Website**: `https://<domain>/k5.txt` containing `k5:<your k5>`.
+
+And your email address, with `k5cli attest email <message.eml>` (or MY EMAIL
+in the desktop interface): send an email from that address to yourself with
+`k5:<your k5>` in the subject, and save it as a `.eml` file. Its DKIM key is
+fetched from DNS (`<selector>._domainkey.<domain>`) and a Plonky2 proof shows
+the email's signed header was signed by that key, which takes a few minutes.
+The attestation publishes the signed headers (From, To, Subject, Date...) and
+the DKIM key, not the body. It is valid if the proof verifies, there is one
+`From` of the DKIM domain (or a subdomain), and the subject has the k5. As
+with any zk-email, it trusts the DKIM key as published when it was made.
 
 Without `--notary-host`, `attest new` runs a notary in-process, signing with
 the key embedded in k5cli (`crates/k5cli/local-notary.pem`), which is also the
@@ -141,8 +153,9 @@ online at start. The menu of the main screen (the three lines) has:
 - `ME`: your attestations.
 - `VERIFY`: paste a signed message, a message for you or an attestation
   record, and see who signed it and whether they are on your web of trust.
-- `TICKET` and `CONNECT`: the first contact, a pairing. Both windows show the
-  check phrase; if they match, keysign the other from the dialog.
+- `CREATE INVITE` (a ticket, also shown as a QR code) and `ACCEPT INVITE`
+  (paste or scan one): the first contact, a pairing. Both windows show the check phrase; if they match, keysign the
+  other from the dialog.
 - `AUTO SYNC`: every minute, the trusted k5s that can be reached peer to peer
   are checked for presence (`P2P · ONLINE`), and every 10 minutes their
   attestations are merged. On by default.
@@ -207,18 +220,6 @@ k5cli fakegraph 50             # a deterministic fake social graph, for testing
 k5cli makedot                  # graph.dot: the web of trust, for Graphviz
 ```
 
-### zk-email proofs
-
-`k5cli` can generate a Plonky2 proof for a supported DKIM-signed `.eml` file.
-Pass a trusted DKIM JSON record with `domain`, `selector` and `record` fields;
-the proof is written to `--output`. It must run in release mode, otherwise the
-prover is too slow:
-
-```sh
-cargo +nightly-2025-07-02 run --release -p k5cli --features zkemail -- \
-  zkemail path/to/message.eml path/to/dkim.json --output email.proof
-```
-
 ## Crates
 
 - [`k5lib`](./crates/k5lib/): the k5 library: keys, attestations, messages,
@@ -232,6 +233,10 @@ The other crates are the TLSNotary implementation k5 builds on, and
 `vendor/mpz-core` a patched copy of one of its dependencies (see its README).
 
 ## Building
+
+k5 builds with a pinned nightly Rust (`rust-toolchain.toml`): Plonky2, the
+proof system of email attestations, needs it. rustup installs it on the first
+build. Proving emails is much faster in release builds.
 
 If the build fails with:
 

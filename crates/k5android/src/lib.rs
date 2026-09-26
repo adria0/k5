@@ -47,6 +47,9 @@ fn run(app: slint::android::AndroidApp) -> anyhow::Result<()> {
         notary_key: k5lib::api::DEFAULT_NOTARY_KEY.to_string(),
         notary: None,
         offline: false,
+        // Proving an email takes minutes and gigabytes: made on computers,
+        // verified here.
+        email_proofs: false,
         scanner: Some(Box::new(scanner)),
     })
 }

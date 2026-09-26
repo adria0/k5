@@ -24,6 +24,7 @@ pub mod iroh;
 pub mod keysignparty;
 pub mod me;
 pub mod tlsnotary;
+pub mod zkemail;
 
 use std::fmt;
 
@@ -62,6 +63,8 @@ pub enum Attested {
     Iroh(iroh::Iroh),
     /// The name a k5 claims for itself.
     Claim(claim::Claim),
+    /// An email address, proven with a DKIM-signed email.
+    Email(zkemail::Email),
 }
 
 /// An attestation of a profile, displayed as `<platform>:<user>`, followed by
@@ -102,6 +105,7 @@ impl Attested {
             Attested::Fake(_) => true,
             Attested::Iroh(_) => false,
             Attested::Claim(_) => false,
+            Attested::Email(_) => false,
         }
     }
 
@@ -173,6 +177,18 @@ impl Attested {
                 file,
                 fake,
             },
+            Attested::Email(email) => ProfileAttestation {
+                profile: email.profile(),
+                attributes: vec![
+                    ("type", zkemail::RECORD_TYPE.to_string()),
+                    ("server", email.domain.clone()),
+                    ("dkim", format!("d={} s={}", email.domain, email.selector)),
+                    ("date", email.created.clone()),
+                ],
+                signer: None,
+                file,
+                fake,
+            },
             Attested::Claim(claim) => ProfileAttestation {
                 profile: claim.profile(),
                 attributes: vec![
@@ -240,6 +256,7 @@ pub fn verify(record: &str, notary_key: &str, keyring: &Keyring) -> Result<Attes
         me::RECORD_TYPE => Attested::Me(Box::new(me::verify(record)?)),
         iroh::RECORD_TYPE => Attested::Iroh(iroh::verify(record, keyring)?),
         claim::RECORD_TYPE => Attested::Claim(claim::verify(record, keyring)?),
+        zkemail::RECORD_TYPE => Attested::Email(zkemail::verify(record)?),
         other => return Err(anyhow!("unsupported attestation type `{other}`")),
     };
 

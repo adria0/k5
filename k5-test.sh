@@ -30,6 +30,7 @@ rm -rf db
 step attest new https://x.com/adria0/status/2103557323306225669
 step attest new https://gist.githubusercontent.com/adria0/5113512aa7121ada3e5a75e7d7f3d791/raw/be13d239b4b4fd2068973099bba9b27e8bf8624a/gistfile1.txt
 step attest new https://ethbcn.dev/k5.txt
+step attest email k5-test.email.eml
 # `attest new` succeeds without storing anything when the page shows no
 # profile: check the three were attested (search matches the user: the
 # handle, or the domain).

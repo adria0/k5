@@ -1,13 +1,18 @@
 // Export of the attestations of a database as a signed message.
 //
-// The message is a bundle with each record encoded as base58:
+// The message is a bundle with each record encoded as base64:
 //
 // k5 export
 // date:<creation time, RFC 3339>
 // count:<number of attestations>
+// encoding:base64
 // attestation:<file name>
-// <base58 of the record, 100 characters per line>
+// <base64 of the record, 100 characters per line>
 // ...
+//
+// Exports made before the `encoding:` line encode records as base58, which
+// merging still reads. Base58 is quadratic in the size of the data: an email
+// attestation (~250 KB) took over a minute to encode.
 //
 // and is signed like any other message, so the export can be checked with
 // `msg verify`, which also verifies each bundled attestation, and merged with
@@ -22,6 +27,7 @@
 use std::collections::{HashMap, HashSet};
 
 use anyhow::{anyhow, Context as _};
+use base64::{engine::general_purpose::STANDARD, Engine};
 
 use super::{
     check, claim, iroh, keyring, keysignparty, me, record_type, Error, Invalid, ProfileAttestation,
@@ -34,7 +40,8 @@ use crate::{
 
 const HEADER: &str = "k5 export";
 const ATTESTATION_PREFIX: &str = "attestation:";
-/// Maximum length of the base58 lines.
+const ENCODING_PREFIX: &str = "encoding:";
+/// Maximum length of the encoded lines.
 const LINE_WIDTH: usize = 100;
 
 /// An attestation record in an export.
@@ -333,7 +340,10 @@ fn check_safe_file_name(file: &str) -> Result<(), Error> {
 }
 
 fn bundle(date: &str, exported: &[Exported]) -> String {
-    let mut bundle = format!("{HEADER}\ndate:{date}\ncount:{}", exported.len());
+    let mut bundle = format!(
+        "{HEADER}\ndate:{date}\ncount:{}\n{ENCODING_PREFIX}base64",
+        exported.len()
+    );
     for exported in exported {
         bundle.push_str(&format!(
             "\n{ATTESTATION_PREFIX}{}\n{}",
@@ -359,6 +369,20 @@ fn parse(msg: &str) -> Result<Vec<Exported>, Error> {
         .and_then(|line| line.strip_prefix("count:"))
         .context("invalid export: expected `count:`")?
         .parse()?;
+    // Older exports have no `encoding:`: base58.
+    let mut lines = lines.peekable();
+    let encoding = match lines
+        .peek()
+        .and_then(|line| line.strip_prefix(ENCODING_PREFIX))
+    {
+        Some("base64") => {
+            lines.next();
+            Encoding::Base64
+        }
+        Some(other) => return Err(anyhow!("invalid export: unknown encoding `{other}`")),
+        None => Encoding::Base58,
+    };
+    let decode = |entry| decode(entry, encoding);
 
     let mut exported = Vec::new();
     let mut current: Option<(String, String)> = None;
@@ -385,25 +409,37 @@ fn parse(msg: &str) -> Result<Vec<Exported>, Error> {
     Ok(exported)
 }
 
-fn decode((file, encoded): (String, String)) -> Result<Exported, Error> {
-    let record = String::from_utf8(
-        bs58::decode(&encoded)
+/// How the records of an export are encoded.
+#[derive(Clone, Copy)]
+enum Encoding {
+    Base64,
+    /// Exports made before the `encoding:` line.
+    Base58,
+}
+
+fn decode((file, encoded): (String, String), encoding: Encoding) -> Result<Exported, Error> {
+    let bytes = match encoding {
+        Encoding::Base64 => STANDARD
+            .decode(&encoded)
+            .map_err(|e| anyhow!("invalid base64 in attestation {file}: {e}"))?,
+        Encoding::Base58 => bs58::decode(&encoded)
             .into_vec()
             .map_err(|e| anyhow!("invalid base58 in attestation {file}: {e}"))?,
-    )
-    .map_err(|_| anyhow!("attestation {file} is not valid UTF-8"))?;
+    };
+    let record =
+        String::from_utf8(bytes).map_err(|_| anyhow!("attestation {file} is not valid UTF-8"))?;
 
     Ok(Exported { file, record })
 }
 
-/// Encodes as base58 in lines of at most [`LINE_WIDTH`] characters.
+/// Encodes as base64 in lines of at most [`LINE_WIDTH`] characters.
 fn encode(data: &[u8]) -> String {
-    let encoded = bs58::encode(data).into_string();
+    let encoded = STANDARD.encode(data);
 
     encoded
         .as_bytes()
         .chunks(LINE_WIDTH)
-        .map(|line| std::str::from_utf8(line).expect("base58 is ascii"))
+        .map(|line| std::str::from_utf8(line).expect("base64 is ascii"))
         .collect::<Vec<_>>()
         .join("\n")
 }
@@ -452,6 +488,35 @@ mod tests {
 
         // A wrong count is detected.
         assert!(parse(&msg.replace("count:2", "count:3")).is_err());
+        // An unknown encoding too.
+        assert!(parse(&msg.replace("encoding:base64", "encoding:rot13")).is_err());
+
+        // An export made before `encoding:`: base58 records.
+        let old = format!(
+            "{HEADER}\ndate:now\ncount:1\n{ATTESTATION_PREFIX}{file}\n{}",
+            bs58::encode(record.as_bytes()).into_string()
+        );
+        let parsed = parse(&old).unwrap();
+        assert_eq!(
+            (parsed[0].file.as_str(), parsed[0].record.as_str()),
+            (file.as_str(), record.as_str())
+        );
+    }
+
+    #[test]
+    fn test_big_records_are_fast() {
+        // An email attestation is ~250 KB: base58 took over a minute.
+        let record = "x".repeat(300_000);
+        let started = std::time::Instant::now();
+        let msg = bundle(
+            "now",
+            &[Exported {
+                file: "big.md".to_string(),
+                record: record.clone(),
+            }],
+        );
+        assert_eq!(parse(&msg).unwrap()[0].record, record);
+        assert!(started.elapsed() < std::time::Duration::from_secs(2));
     }
 
     #[test]

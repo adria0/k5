@@ -186,7 +186,7 @@ pub async fn run(me: &Keys, db: &dyn Db, n: usize, seed: u64) -> Result<Summary,
         )
         .collect();
 
-    // Signing and base58 encoding dominate, so records are created in
+    // Signing and encoding dominate, so records are created in
     // parallel. They are not verified here, as the audit verifies them all.
     let records = parallel_map(&edges, |edge| {
         let signer = edge.signer.map_or(me, |signer| &identities[signer].keys);

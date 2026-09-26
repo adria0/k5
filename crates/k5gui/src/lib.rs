@@ -52,6 +52,9 @@ pub struct Options {
     pub notary: Option<NotaryConfig>,
     /// Do not go online: messages are only copied to the clipboard.
     pub offline: bool,
+    /// Email attestations can be made (proving takes minutes and a lot of
+    /// memory: not on phones).
+    pub email_proofs: bool,
     /// The camera, to read tickets from QR codes; `None` if there is none.
     pub scanner: Option<Box<dyn scanner::Scanner>>,
 }
@@ -90,6 +93,7 @@ pub fn start(options: Options) -> anyhow::Result<()> {
     let attesting = gui::Attesting {
         notary,
         presentations: options.db.join("presentations"),
+        email_proofs: options.email_proofs,
     };
 
     gui::run(

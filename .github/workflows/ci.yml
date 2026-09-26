@@ -23,7 +23,8 @@ env:
   # 32 seems to be big enough for the foreseeable future
   RAYON_NUM_THREADS: 32
   GIT_COMMIT_HASH: ${{ github.event.pull_request.head.sha || github.sha }}
-  RUST_VERSION: 1.87.0
+  # The pinned nightly of rust-toolchain.toml (plonky2 needs nightly).
+  RUST_VERSION: nightly-2026-09-24
 
 jobs:
   clippy:
@@ -59,14 +60,14 @@ jobs:
       - name: Install nightly rust toolchain with rustfmt
         uses: dtolnay/rust-toolchain@stable
         with:
-          toolchain: nightly-2026-02-15
+          toolchain: nightly-2026-09-24
           components: rustfmt
 
       - name: Use caching
         uses: Swatinem/rust-cache@v2.7.7
 
       - name: Check formatting
-        run: cargo +nightly-2026-02-15 fmt --check --all
+        run: cargo +nightly-2026-09-24 fmt --check --all
 
   build-and-test:
     name: Build and test

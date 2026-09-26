@@ -1,0 +1,71 @@
+Received: by mail-tester.com (Postfix, from userid 998)
+	id 54A6BFC32A; Sat, 26 Sep 2026 17:09:58 +0000 (UTC)
+X-Spam-Checker-Version: SpamAssassin 4.0.2 (2025-08-27) on mail-tester.com
+X-Spam-Level:
+X-Spam-Status: No/-0.2/5.0
+X-Spam-Test-Scores: DKIM_SIGNED=0.1,DKIM_VALID=-0.1,DKIM_VALID_AU=-0.1,
+	DKIM_VALID_EF=-0.1,HTML_MESSAGE=0.001,RCVD_IN_MSPIKE_H5=0.001,
+	RCVD_IN_MSPIKE_WL=0.001,SPF_HELO_PASS=-0.001,SPF_PASS=-0.001
+X-Spam-Last-External-IP: 109.224.244.123
+X-Spam-Last-External-HELO: mail-244123.protonmail.ch
+X-Spam-Last-External-rDNS: mail-244123.protonmail.ch
+X-Spam-Date-of-Scan: Sat, 26 Sep 2026 17:09:58 +0000
+X-Spam-Report:
+	*  0.0 RCVD_IN_MSPIKE_H5 RBL: Excellent reputation (+5)
+	*      [109.224.244.123 listed in wl.mailspike.net]
+	* -0.0 SPF_HELO_PASS SPF: HELO matches SPF record
+	* -0.0 SPF_PASS SPF: sender matches SPF record
+	* -0.1 DKIM_VALID_EF Message has a valid DKIM or DK signature from
+	*      envelope-from domain
+	* -0.1 DKIM_VALID_AU Message has a valid DKIM or DK signature from author's
+	*       domain
+	*  0.1 DKIM_SIGNED Message has a DKIM or DK signature, not necessarily
+	*      valid
+	* -0.1 DKIM_VALID Message has at least one valid DKIM or DK signature
+	*  0.0 RCVD_IN_MSPIKE_WL Mailspike good senders
+	*  0.0 HTML_MESSAGE BODY: HTML included in message
+DMARC-Filter: OpenDMARC Filter v1.4.2 mail-tester.com 95E8EFC05C
+Authentication-Results: mail-tester.com; dmarc=pass (p=quarantine dis=none) header.from=proton.me
+Authentication-Results: dkim.mail-tester.com;
+	dkim=pass (2048-bit key; unprotected) header.d=proton.me header.i=@proton.me header.a=rsa-sha256 header.s=protonmail2 header.b=r/DLr07m;
+	dkim-atps=neutral
+Received-SPF: Pass (mailfrom) identity=mailfrom; client-ip=109.224.244.123; helo=mail-244123.protonmail.ch; envelope-from=adriamassanet@proton.me; receiver=<UNKNOWN>
+Received: from mail-244123.protonmail.ch (mail-244123.protonmail.ch [109.224.244.123])
+	by mail-tester.com (Postfix) with ESMTPS id 95E8EFC05C
+	for <adria0-clientID-currenttimestamp@srv1.mail-tester.com>; Sat, 26 Sep 2026 17:09:55 +0000 (UTC)
+DKIM-Signature: v=1; a=rsa-sha256; c=relaxed/relaxed; d=proton.me;
+	s=protonmail2; t=1790442595; x=1790701795;
+	bh=l7PoCMkCnlrZ8/97ggyGnI9rmWJ0Cqf2rzssXKSqsv0=;
+	h=Date:To:From:Subject:Message-ID:Feedback-ID:From:To:Cc:Date:
+	 Subject:Reply-To:Feedback-ID:Message-ID:BIMI-Selector;
+	b=r/DLr07mUnXzQk79VtPqNk27/BZkPs/j7/VKu5ENMJ85ZIk/IomLfVqF9LJ96IW3e
+	 IlUYTCosu5v3aX3JCX9ibJgxN6FMYMCwq1M+g0fdXoCv3bIU+QS4e6db0jM+1JRpDs
+	 V8/DhGIt5VAWKqqtbogP96iFmRUy2C6WieO90cTQXjUYXQ0cdgD0llKM1VFJBmtxZt
+	 LGgAxopxA75zC+OyVkz184VNs3moQy6enQSYRwkQruSEQKrnkcfdyHgu3/M76o5q34
+	 Qfd2T2y0N3w/01tY40KWd1k25zqWGS34cEnxhxbvVbAoj3174MiD/JLzvP5NxlK9M7
+	 gE0gQ++55KGhQ==
+Date: Sat, 26 Sep 2026 17:09:50 +0000
+To: "adria0-clientID-currenttimestamp@srv1.mail-tester.com" <adria0-clientID-currenttimestamp@srv1.mail-tester.com>
+From: =?utf-8?Q?Adri=C3=A0_Massanet?= <adriamassanet@proton.me>
+Subject: k5:f1e98004580d1f9bb6c3a316dd1bbf881482f5c1ad59add93271519819e01afb
+Message-ID: <gI0ZewD1iI8jhkvsq9qMw-g16PvhIOpgJmdSrGw-MZxqYXe1MtOmY9QPNUgsQF4eEB1ZZUCgQ6zzPS81gxu6DF1uNc-OTFWFAeP3qz65_SI=@proton.me>
+Feedback-ID: 120153647:user:proton
+X-Pm-Message-ID: c60409e8480f72a684bf50b7e9655bf89c59ea5e
+MIME-Version: 1.0
+Content-Type: multipart/alternative;
+ boundary="b1=_1EPdfxR6ekKHsO1Z3eWfsm4ogv3TjZWuWt1aUMZMxNE"
+
+--b1=_1EPdfxR6ekKHsO1Z3eWfsm4ogv3TjZWuWt1aUMZMxNE
+Content-Type: text/plain; charset=utf-8
+Content-Transfer-Encoding: base64
+
+RW1wdHkgTWVzc2FnZQ==
+
+--b1=_1EPdfxR6ekKHsO1Z3eWfsm4ogv3TjZWuWt1aUMZMxNE
+Content-Type: text/html; charset=utf-8
+Content-Transfer-Encoding: base64
+
+PGRpdj5FbXB0eSBNZXNzYWdlPC9kaXY+
+
+
+--b1=_1EPdfxR6ekKHsO1Z3eWfsm4ogv3TjZWuWt1aUMZMxNE--

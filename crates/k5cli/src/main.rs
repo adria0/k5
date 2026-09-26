@@ -8,7 +8,7 @@ mod fakegraph;
 mod local_notary;
 mod p2p;
 
-use anyhow::anyhow;
+use anyhow::{anyhow, Context as _};
 use clap::{Args, Parser, Subcommand};
 
 use k5lib::api::{
@@ -50,21 +50,6 @@ enum Command {
     /// Talk to other k5s peer to peer over iroh: deliver signcrypted
     /// messages, merge their attestations. Only k5s on your web of trust.
     P2p(p2p::P2pArgs),
-    #[cfg(feature = "zkemail")]
-    /// Generate a Plonky2 proof for a DKIM-signed email.
-    Zkemail(ZkemailArgs),
-}
-
-#[cfg(feature = "zkemail")]
-#[derive(Args, Debug)]
-struct ZkemailArgs {
-    /// DKIM-signed RFC 5322 email file.
-    eml: std::path::PathBuf,
-    /// JSON file containing the trusted DKIM domain, selector, and TXT record.
-    dkim: std::path::PathBuf,
-    /// File to which the serialized Plonky2 proof is written.
-    #[clap(long)]
-    output: std::path::PathBuf,
 }
 
 #[derive(Args, Debug)]
@@ -131,7 +116,7 @@ enum AttestCommand {
     /// Exits with an error if any is invalid.
     Audit(ListArgs),
     /// Export the valid attestations in `db/attestations/` as a signed
-    /// message, each attestation encoded as base58.
+    /// message, each attestation encoded as base64.
     Export(ExportArgs),
     /// Merge into `db/attestations/` the valid attestations of a file
     /// written by `attest export` that are on your web of trust, after
@@ -144,6 +129,15 @@ enum AttestCommand {
     /// `db/attestations/`.
     #[command(alias = "keysignparty")]
     Keysign(KeysignArgs),
+    /// Attest your email address with a zero-knowledge proof of a
+    /// DKIM-signed email: one you sent to yourself with `k5:<your k5>` in
+    /// the subject, saved as a `.eml` file. The DKIM key is fetched from DNS.
+    /// Proving takes minutes. The email's signed header is published in the
+    /// attestation; its body is not.
+    Email {
+        /// The email, as a `.eml` file.
+        eml: std::path::PathBuf,
+    },
     /// Claim your name: a statement signed by your k5, shared with your
     /// attestations. Replaces your previous claim.
     Name {
@@ -268,18 +262,18 @@ struct VerifyArgs {
 
 #[tokio::main]
 async fn main() -> anyhow::Result<()> {
+    // Only warnings by default: the libraries' progress (iroh's network
+    // probes, plonky2 building the circuit of an email attestation...) is
+    // noise here. `RUST_LOG` shows more, e.g. `RUST_LOG=info`.
     tracing_subscriber::fmt()
         .with_writer(std::io::stderr)
+        .with_env_filter(
+            tracing_subscriber::EnvFilter::try_from_default_env()
+                .unwrap_or_else(|_| tracing_subscriber::EnvFilter::new("warn")),
+        )
         .init();
 
     let cli = Cli::parse();
-
-    #[cfg(feature = "zkemail")]
-    {
-        if let Command::Zkemail(args) = &cli.command {
-            return run_zkemail(args);
-        }
-    }
 
     let k5 = match cli.command {
         Command::Init => {
@@ -320,6 +314,7 @@ async fn main() -> anyhow::Result<()> {
                 run_merge(&args, &k5.with_notary_key(&args.notary_key)).await
             }
             AttestCommand::Keysign(args) => run_keysign(&args, &k5).await,
+            AttestCommand::Email { eml } => run_attest_email(&eml, &k5).await,
             AttestCommand::Name { name } => {
                 k5.ensure_self_attestation().await?;
                 println!("{}", k5.claim_name(&name).await?);
@@ -336,24 +331,18 @@ async fn main() -> anyhow::Result<()> {
                 run_verify(&args, &k5.with_notary_key(&args.notary_key)).await
             }
         },
-        #[cfg(feature = "zkemail")]
-        Command::Zkemail(_) => unreachable!("zkemail is handled before loading k5 keys"),
     }
 }
 
-#[cfg(feature = "zkemail")]
-fn run_zkemail(args: &ZkemailArgs) -> anyhow::Result<()> {
-    let proof = k5lib::api::zkemail(&args.eml, &args.dkim)?;
-    std::fs::write(&args.output, &proof.bytes)?;
-    println!(
-        "Generated {}-byte proof for d={}, s={} ({} gate rows, {} padded rows): {}",
-        proof.bytes.len(),
-        proof.domain,
-        proof.selector,
-        proof.gate_rows,
-        proof.padded_rows,
-        args.output.display()
-    );
+async fn run_attest_email(eml: &std::path::Path, k5: &K5) -> anyhow::Result<()> {
+    let raw = std::fs::read(eml).with_context(|| format!("cannot read {}", eml.display()))?;
+    let (domain, selector) = k5lib::api::dkim_selector(&raw)?;
+    println!("Fetching the DKIM key of {domain} (selector {selector}) ...");
+    let key = k5net::dkim_key(&domain, &selector).await?;
+    println!("Proving the signed header (this takes a while) ...");
+    k5.ensure_self_attestation().await?;
+    println!("{}", k5.attest_email(raw, key).await?);
+
     Ok(())
 }
 
@@ -744,6 +733,16 @@ fn print_attested(attested: Attested) -> anyhow::Result<()> {
         }
         Attested::Claim(claim) => {
             println!("{} created:{}{fake}", claim.profile(), claim.date);
+            return Ok(());
+        }
+        Attested::Email(email) => {
+            println!(
+                "{} dkim:d={} s={} created:{}",
+                email.profile(),
+                email.domain,
+                email.selector,
+                email.created
+            );
             return Ok(());
         }
     };

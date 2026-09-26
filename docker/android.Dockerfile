@@ -28,7 +28,13 @@ RUN mkdir -p "$ANDROID_HOME/cmdline-tools" \
         "platform-tools" "platforms;android-34" "build-tools;34.0.0" "ndk;${NDK_VERSION}"
 ENV ANDROID_NDK_ROOT=/opt/android-sdk/ndk/27.2.12479018
 
-RUN rustup target add aarch64-linux-android \
+# The pinned nightly of the repository's rust-toolchain.toml (plonky2 needs
+# nightly), with its components: containers are thrown away, so nothing
+# would stay installed otherwise.
+ARG RUST_TOOLCHAIN=nightly-2026-09-24
+RUN rustup toolchain install "$RUST_TOOLCHAIN" --profile minimal \
+        --component rustfmt,clippy --target aarch64-linux-android \
+    && rustup target add aarch64-linux-android \
     && cargo install cargo-apk --version 0.10.0 --locked
 
 WORKDIR /k5

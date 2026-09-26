@@ -20,3 +20,44 @@ mod proto;
 
 pub use iroh::{address_lookup::MemoryLookup, SecretKey};
 pub use node::{load_or_create_secret, Contact, Event, Network, Node, PAIRING_WINDOW};
+
+/// The DKIM public key of `domain` for `selector`, as published in DNS
+/// (`<selector>._domainkey.<domain>`), for email attestations.
+pub async fn dkim_key(domain: &str, selector: &str) -> anyhow::Result<k5lib::api::DkimKey> {
+    use anyhow::Context as _;
+
+    let name = format!("{selector}._domainkey.{domain}");
+    let resolver = iroh::dns::DnsResolver::new();
+    let records = resolver
+        .lookup_txt(&name, std::time::Duration::from_secs(10))
+        .await
+        .with_context(|| format!("no DKIM key at {name}"))?;
+    let record = records
+        .map(|record| record.to_string())
+        .find(|record| record.contains("p="))
+        .with_context(|| format!("no DKIM key at {name}"))?;
+
+    Ok(k5lib::api::DkimKey {
+        domain: domain.to_string(),
+        selector: selector.to_string(),
+        record,
+    })
+}
+
+#[cfg(test)]
+mod tests {
+    /// Fetches the DKIM key of the zk-email fixture (icloud.com, selector
+    /// 1a1hai) from DNS: the one recorded with the fixture. Needs internet.
+    #[tokio::test]
+    #[ignore = "needs DNS on the internet"]
+    async fn test_dkim_key() {
+        let key = super::dkim_key("icloud.com", "1a1hai").await.unwrap();
+        let fixture: serde_json::Value = serde_json::from_str(include_str!(
+            "../../plonky2-zkemail/examples/fixtures/icloud-dkim.json"
+        ))
+        .unwrap();
+        assert_eq!(key.record, fixture["record"].as_str().unwrap());
+
+        assert!(super::dkim_key("example.invalid", "none").await.is_err());
+    }
+}

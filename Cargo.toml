@@ -46,6 +46,17 @@ resolver = "2"
 inherits = "release"
 opt-level = 1
 
+# Email attestations: proofs are verified whenever attestations are listed,
+# too slow unoptimized.
+[profile.dev.package.plonky2]
+opt-level = 3
+
+[profile.dev.package.plonky2_field]
+opt-level = 3
+
+[profile.dev.package.plonky2-zkemail]
+opt-level = 3
+
 [profile.release.package."tlsn-wasm"]
 opt-level = "z"
 

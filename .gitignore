@@ -20,6 +20,8 @@ target/
 
 # transcript
 *.json
+# except fixtures
+!crates/plonky2-zkemail/examples/fixtures/*.json
 
 # env var
 *.env

@@ -1,0 +1,6 @@
+# k5 builds with a pinned nightly: plonky2, the proof system of the email
+# attestations (crates/plonky2-zkemail), needs it. The Android build image
+# (docker/android.Dockerfile) and CI use the same one.
+[toolchain]
+channel = "nightly-2026-09-24"
+components = ["rustfmt", "clippy"]

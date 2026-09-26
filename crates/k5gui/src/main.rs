@@ -66,6 +66,7 @@ fn main() -> anyhow::Result<()> {
             max_recv: cli.max_recv,
         }),
         offline: cli.offline,
+        email_proofs: true,
         // No camera on the desktop: tickets are pasted.
         scanner: None,
     })

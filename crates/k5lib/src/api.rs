@@ -18,7 +18,7 @@ use std::{
 use anyhow::{anyhow, Context as _};
 
 use crate::{
-    attestations::{self, claim, export, iroh, keysignparty, me, tlsnotary},
+    attestations::{self, claim, export, iroh, keysignparty, me, tlsnotary, zkemail},
     db::{Db, FsDb},
     graph,
     k5id::K5Id,
@@ -33,12 +33,15 @@ pub use crate::{
         keysignparty::KeySign,
         me::{Created, Me},
         tlsnotary::{Notarized, NotaryConfig, Verified as TlsnVerified},
+        zkemail::dkim_selector,
         Attested, Checked, Invalid, Listing, Profile, ProfileAttestation,
     },
     db::{DIR as ATTESTATIONS_DIR, INBOX_DIR, SENT_DIR},
     signcrypt::Opened,
     Error,
 };
+/// A DKIM public key as published in DNS, for [`K5::attest_email`].
+pub use plonky2_zkemail::eml::TrustedKey as DkimKey;
 
 /// Default notary public key (compressed secp256k1, hex): the key of the
 /// local notary embedded in k5cli.
@@ -327,6 +330,18 @@ impl K5 {
         Ok(MergeReport { signer, merged })
     }
 
+    /// Attests an email address with the raw email `eml` (a `.eml` its owner
+    /// sent to themselves, with `k5:<k5>` in the subject), signed by the
+    /// DKIM key `key` (as published in DNS): proves it, which takes minutes
+    /// (on a blocking thread), and stores the attestation. Returns where.
+    pub async fn attest_email(&self, eml: Vec<u8>, key: DkimKey) -> Result<String, Error> {
+        let (file, record) =
+            tokio::task::spawn_blocking(move || zkemail::create(&eml, &key)).await??;
+        self.db().put(&file, &record).await?;
+
+        Ok(self.db().location(&file))
+    }
+
     /// Claims `name` as the name of the local k5, replacing its previous
     /// claim. Returns where it was stored.
     pub async fn claim_name(&self, name: &str) -> Result<String, Error> {
@@ -569,13 +584,6 @@ fn message_time(name: &str) -> u64 {
         .next()
         .and_then(|millis| millis.parse().ok())
         .unwrap_or(0)
-}
-
-/// Generates a Plonky2 proof for a DKIM-signed email. Proving is CPU-bound,
-/// so this is synchronous.
-#[cfg(feature = "zkemail")]
-pub fn zkemail(eml: &Path, dkim: &Path) -> Result<plonky2_zkemail::eml::EmailProof, Error> {
-    Ok(plonky2_zkemail::eml::prove(eml, dkim)?)
 }
 
 #[cfg(test)]

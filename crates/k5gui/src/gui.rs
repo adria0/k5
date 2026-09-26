@@ -163,6 +163,9 @@ pub struct Attesting {
     pub notary: Option<NotaryConfig>,
     /// Where the TLSNotary presentations are written.
     pub presentations: PathBuf,
+    /// Email attestations can be made here (proving takes minutes and a lot
+    /// of memory: not on phones).
+    pub email_proofs: bool,
 }
 
 /// Opens the window, blocking until it is closed. Unless `offline`, starts
@@ -178,6 +181,7 @@ pub fn run(
     ui.set_me(short(&k5.k5()).into());
     ui.set_me_k5(k5.k5().into());
     ui.set_can_scan(scanner.is_some());
+    ui.set_can_prove_email(attesting.email_proofs);
     ui.set_me_glyph(ModelRc::new(VecModel::from(glyph(&k5.k5()))));
     if let Some(notary) = &attesting.notary {
         ui.set_notary(format!("{}:{}", notary.host, notary.port).into());
@@ -675,6 +679,7 @@ impl Worker {
             github: count("github"),
             site: count("site"),
             keysign: count("keysignparty"),
+            email: count("email"),
         };
 
         let glyph = glyph(k5);
@@ -831,7 +836,7 @@ impl Worker {
         let Some(node) = self.node.clone() else {
             return self.status("OFFLINE".to_string(), false);
         };
-        self.status("MAKING TICKET ...".to_string(), true);
+        self.status("CREATING INVITE ...".to_string(), true);
         self.background(
             runtime,
             move |runtime| runtime.block_on(node.ticket()),
@@ -842,12 +847,12 @@ impl Worker {
                 let status = match ticket {
                     Ok(ticket) => match worker.copy(ticket) {
                         Ok(()) => format!(
-                            "TICKET COPIED TO CLIPBOARD: PAIRING OPEN FOR {} MINUTES",
+                            "INVITE COPIED TO CLIPBOARD: OPEN FOR {} MINUTES",
                             PAIRING_WINDOW.as_secs() / 60
                         ),
                         Err(e) => format!("COPY TO CLIPBOARD FAILED: {e:#}"),
                     },
-                    Err(e) => format!("NO TICKET: {e:#}"),
+                    Err(e) => format!("NO INVITE: {e:#}"),
                 };
                 worker.status(status, false);
             },
@@ -882,12 +887,12 @@ impl Worker {
             Err(e) => return self.status(format!("PASTE FAILED: {e:#}"), false),
         };
         let Some(ticket) = crate::clipboard::find_ticket(&text).map(str::to_string) else {
-            return self.status("NO TICKET ON THE CLIPBOARD".to_string(), false);
+            return self.status("NO INVITE ON THE CLIPBOARD".to_string(), false);
         };
         let _ = self
             .ui
             .upgrade_in_event_loop(move |ui| ui.set_connect_text(ticket.into()));
-        self.status("TICKET PASTED".to_string(), false);
+        self.status("INVITE PASTED".to_string(), false);
     }
 
     /// Starts the camera: its frames are shown and searched for a ticket's
@@ -924,7 +929,7 @@ impl Worker {
             scanner.stop();
         }
         let status = match &scanned {
-            Ok(_) => "TICKET SCANNED".to_string(),
+            Ok(_) => "INVITE SCANNED".to_string(),
             Err(e) => format!("CAMERA: {e}"),
         };
         let _ = self.ui.upgrade_in_event_loop(move |ui| {
@@ -1340,6 +1345,9 @@ impl Worker {
     /// Attests a profile of the local k5 with the notary: notarizes, in the
     /// background, the page that shows the k5 and stores the attestation.
     fn attest(&mut self, runtime: &tokio::runtime::Runtime, kind: &str, input: &str) {
+        if kind == "email" {
+            return self.attest_email(runtime, input);
+        }
         let Some(notary) = self.attesting.notary.clone() else {
             return self.status(
                 "NO NOTARY: START K5GUI WITH --notary-host".to_string(),
@@ -1392,12 +1400,47 @@ impl Worker {
             Ok(Err(reason)) => return self.status(format!("NOT ATTESTED: {reason}"), false),
             Err(e) => return self.status(format!("ATTEST FAILED: {e:#}"), false),
         };
+        self.stored_attestation(runtime, &stored);
+    }
 
+    /// Attests the email address of the `.eml` file at `path` (sent to
+    /// yourself, with your k5 in the subject): fetches its DKIM key from DNS
+    /// and proves it, in the background (minutes).
+    fn attest_email(&mut self, runtime: &tokio::runtime::Runtime, path: &str) {
+        let path = PathBuf::from(path.trim());
+        self.status(
+            "PROVING THE EMAIL (THIS TAKES MINUTES) ...".to_string(),
+            true,
+        );
+        let k5 = self.k5.clone();
+        self.background(
+            runtime,
+            move |runtime| {
+                runtime.block_on(async {
+                    let raw = std::fs::read(&path)
+                        .map_err(|e| anyhow::anyhow!("cannot read {}: {e}", path.display()))?;
+                    let (domain, selector) = k5lib::api::dkim_selector(&raw)?;
+                    let key = k5net::dkim_key(&domain, &selector).await?;
+                    k5.attest_email(raw, key).await
+                })
+            },
+            |worker, runtime, stored| match stored {
+                Ok(stored) => worker.stored_attestation(runtime, &stored),
+                Err(e) => worker.status(format!("ATTEST FAILED: {e:#}"), false),
+            },
+        );
+    }
+
+    /// Shows an attestation just stored (at `stored`): with the others of
+    /// the local k5, if it is about it.
+    fn stored_attestation(&mut self, runtime: &tokio::runtime::Runtime, stored: &str) {
         // Records are named after the k5 they attest.
         let me = self.k5.k5();
-        let file = Path::new(&stored)
+        let file = Path::new(stored)
             .file_name()
-            .map_or(stored.clone(), |file| file.to_string_lossy().into_owned());
+            .map_or(stored.to_string(), |file| {
+                file.to_string_lossy().into_owned()
+            });
         self.rescan(runtime);
         if !file.starts_with(&me) {
             return self.status(
@@ -1547,7 +1590,7 @@ fn attest_url(kind: &str, input: &str) -> Result<String, String> {
             }
             Ok(format!("https://{domain}/k5.txt"))
         }
-        "email" => Err("EMAIL ATTESTATIONS ARE NOT AVAILABLE YET".to_string()),
+        "email" => Err("EMAIL ATTESTATIONS ARE PROVEN, NOT NOTARIZED".to_string()),
         other => Err(format!("UNKNOWN PROFILE `{other}`")),
     }
 }
@@ -1746,6 +1789,7 @@ fn icon(platform: &str) -> &'static str {
         "X" => "x",
         "github" => "github",
         "site" => "site",
+        "email" => "email",
         _ => "other",
     }
 }
@@ -1851,7 +1895,8 @@ mod tests {
     /// `chat.ppm`, `chat-draft.ppm`, `dossier.ppm`, `connect.ppm`,
     /// `attest-x.ppm`, `attest-site.ppm`, `attest-email.ppm`, `me.ppm`,
     /// `verify.ppm`, `verify-invalid.ppm`, `pairing.ppm`, `ticket.ppm`,
-    /// `ticket-qr.ppm`, `scan.ppm` and `name.ppm`, with the software
+    /// `ticket-qr.ppm`, `scan.ppm`, `name.ppm` and `attest-email-phone.ppm`,
+    /// with the software
     /// renderer, to look at the design without a display.
     #[test]
     #[ignore = "writes window snapshots to $K5_SNAPSHOT"]
@@ -1908,6 +1953,7 @@ mod tests {
             online: true,
             live: true,
             trusted: true,
+            email: 1,
             me: false,
             x: 1,
             github: 1,
@@ -2032,7 +2078,7 @@ mod tests {
         click(menu_x, menu_y);
         click(menu_x, entry(2.0));
         // TICKET asks what to do with whoever pairs, first.
-        assert!(ui.get_ticket_dialog(), "TICKET");
+        assert!(ui.get_ticket_dialog(), "CREATE INVITE");
         ui.set_ticket_dialog(false);
         click(menu_x, menu_y);
         click(menu_x, entry(3.0));
@@ -2090,7 +2136,11 @@ mod tests {
         ui.set_attest_input("example.com".into());
         render("attest-site");
         ui.set_attest_kind("email".into());
+        ui.set_attest_input("".into());
+        ui.set_can_prove_email(true);
         render("attest-email");
+        ui.set_can_prove_email(false);
+        render("attest-email-phone");
         ui.set_attest_kind("".into());
         let owned = |icon: &str, title: &str, detail: &str| Owned {
             icon: icon.into(),
@@ -2202,6 +2252,7 @@ mod tests {
         let attesting = Attesting {
             notary: None,
             presentations: dir.join("presentations"),
+            email_proofs: false,
         };
         let mut worker = Worker::new(Arc::new(k5), slint::Weak::default(), attesting, tx);
         let runtime = tokio::runtime::Builder::new_multi_thread()
@@ -2249,6 +2300,7 @@ mod tests {
         let attesting = Attesting {
             notary: None,
             presentations: dir.join("presentations"),
+            email_proofs: false,
         };
         let mut worker = Worker::new(Arc::new(k5), slint::Weak::default(), attesting, tx);
         let runtime = tokio::runtime::Builder::new_multi_thread()

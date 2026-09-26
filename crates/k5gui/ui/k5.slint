@@ -66,6 +66,7 @@ export struct Dossier {
     github: int,
     site: int,
     keysign: int,
+    email: int,
 }
 
 // A conversation with a k5, in the list of conversations.
@@ -382,6 +383,36 @@ component TermButton {
     }
 }
 
+// `k5:<k5> [COPY]`: the local k5, to publish in a profile.
+component K5Copy inherits Rectangle {
+    in property <string> k5;
+    callback copy();
+    border-width: 2px;
+    border-color: Palette.ink;
+    HorizontalLayout {
+        padding: 10px;
+        spacing: 10px;
+        Text {
+            horizontal-stretch: 1;
+            color: Palette.text;
+            text: "k5:" + root.k5;
+            font-size: 22px;
+            wrap: char-wrap;
+            vertical-alignment: center;
+        }
+
+        VerticalLayout {
+            alignment: center;
+            TermButton {
+                text: "COPY";
+                clicked => {
+                    root.copy();
+                }
+            }
+        }
+    }
+}
+
 // A thin scroll position mark for a Flickable.
 component ScrollMark inherits Rectangle {
     in property <length> offset;
@@ -635,7 +666,7 @@ component MainMenu {
                     }
                 }
                 if !root.attesting: MenuItem {
-                    text: "TICKET";
+                    text: "CREATE INVITE";
                     enabled: root.online;
                     clicked => {
                         root.ticket();
@@ -643,7 +674,7 @@ component MainMenu {
                     }
                 }
                 if !root.attesting: MenuItem {
-                    text: "CONNECT";
+                    text: "ACCEPT INVITE";
                     enabled: root.online && !root.busy;
                     clicked => {
                         root.connect();
@@ -764,6 +795,9 @@ export component AppWindow inherits Window {
     in-out property <bool> connect-import: true;
     // The local k5, in full.
     in property <string> me-k5;
+    // Email attestations can be made here (proving takes minutes: not on
+    // phones).
+    in property <bool> can-prove-email;
     // The notary that attests profiles (`host:port`), empty if none is
     // configured.
     in property <string> notary;
@@ -1423,6 +1457,11 @@ export component AppWindow inherits Window {
             }
 
             Gauge {
+                label: "EMAIL";
+                value: root.dossier.email;
+            }
+
+            Gauge {
                 label: "KEYSIGN";
                 value: root.dossier.keysign;
             }
@@ -1706,12 +1745,82 @@ export component AppWindow inherits Window {
 
             DotsH { }
 
-            if root.attest-kind == "email": Text {
+            // An email to yourself with the k5 in its subject, proven with its
+            // DKIM signature: minutes of computing, so not on phones.
+            if root.attest-kind == "email" && !root.can-prove-email: Text {
                 vertical-stretch: 0;
                 color: Palette.text;
-                text: "EMAIL ATTESTATIONS ARE NOT AVAILABLE YET. K5CLI CAN PROVE A DKIM-SIGNED EMAIL WITH ZK-EMAIL (K5CLI ZKEMAIL), BUT THE PROOF IS NOT STORED AS AN ATTESTATION.";
+                text: "EMAIL ATTESTATIONS ARE MADE WITH K5 ON YOUR COMPUTER (MY EMAIL THERE, OR K5CLI ATTEST EMAIL): PROVING TAKES MINUTES. THEY REACH THIS PHONE WHEN YOU SYNC.";
                 font-size: 24px;
                 wrap: word-wrap;
+            }
+
+            if root.attest-kind == "email" && root.can-prove-email: VerticalLayout {
+                spacing: 14px;
+                vertical-stretch: 0;
+                Text {
+                    color: Palette.text;
+                    text: "1. SEND AN EMAIL FROM YOUR ADDRESS TO YOURSELF, WITH YOUR K5 IN THE SUBJECT:";
+                    font-size: 24px;
+                    wrap: word-wrap;
+                }
+
+                K5Copy {
+                    k5: root.me-k5;
+                    copy => {
+                        root.copy-k5();
+                    }
+                }
+
+                Text {
+                    color: Palette.text;
+                    text: "2. SAVE IT AS A .EML FILE (GMAIL: \u{22EE} > DOWNLOAD MESSAGE; APPLE MAIL: FILE > SAVE AS, RAW MESSAGE SOURCE) AND TYPE ITS PATH:";
+                    font-size: 24px;
+                    wrap: word-wrap;
+                }
+
+                Rectangle {
+                    height: 44px;
+                    border-width: 2px;
+                    border-color: Palette.ink;
+                    clip: true;
+                    TermInput {
+                        x: 10px;
+                        width: parent.width - 20px;
+                        height: parent.height;
+                        text <=> root.attest-input;
+                        font-size: 22px;
+                        vertical-alignment: center;
+                    }
+
+                    if root.attest-input == "": Text {
+                        x: 10px;
+                        height: parent.height;
+                        vertical-alignment: center;
+                        text: "/Users/YOU/Downloads/k5.eml";
+                        font-size: 22px;
+                        color: Palette.dim;
+                    }
+                }
+
+                Text {
+                    color: Palette.dim;
+                    text: "3. ITS DKIM SIGNATURE IS PROVEN (MINUTES). THE SIGNED HEADERS (FROM, TO, SUBJECT, DATE...) ARE PUBLISHED; THE BODY IS NOT.";
+                    font-size: 20px;
+                    wrap: word-wrap;
+                }
+
+                HorizontalLayout {
+                    alignment: end;
+                    TermButton {
+                        text: "ATTEST";
+                        primary: true;
+                        enabled: root.attest-input != "" && !root.busy;
+                        clicked => {
+                            root.attest(root.attest-kind, root.attest-input);
+                        }
+                    }
+                }
             }
 
             if root.attest-kind != "email": VerticalLayout {
@@ -1724,30 +1833,10 @@ export component AppWindow inherits Window {
                     wrap: word-wrap;
                 }
 
-                Rectangle {
-                    border-width: 2px;
-                    border-color: Palette.ink;
-                    HorizontalLayout {
-                        padding: 10px;
-                        spacing: 10px;
-                        Text {
-                            horizontal-stretch: 1;
-                            color: Palette.text;
-                            text: "k5:" + root.me-k5;
-                            font-size: 22px;
-                            wrap: char-wrap;
-                            vertical-alignment: center;
-                        }
-
-                        VerticalLayout {
-                            alignment: center;
-                            TermButton {
-                                text: "COPY";
-                                clicked => {
-                                    root.copy-k5();
-                                }
-                            }
-                        }
+                K5Copy {
+                    k5: root.me-k5;
+                    copy => {
+                        root.copy-k5();
                     }
                 }
 
@@ -1837,7 +1926,7 @@ export component AppWindow inherits Window {
                 spacing: 12px;
                 Text {
                     color: Palette.text;
-                    text: "CONNECT";
+                    text: "ACCEPT INVITE";
                     font-family: "Doto";
                     font-weight: 900;
                     font-size: 32px;
@@ -1845,7 +1934,7 @@ export component AppWindow inherits Window {
 
                 Text {
                     color: Palette.dim;
-                    text: "PASTE THE TICKET OF THE K5 TO PAIR WITH";
+                    text: "PASTE OR SCAN THE INVITE OF THE K5 TO PAIR WITH";
                     font-size: 20px;
                     wrap: word-wrap;
                 }
@@ -1926,7 +2015,7 @@ export component AppWindow inherits Window {
 
                 if root.connect-keysign: Text {
                     color: Palette.dim;
-                    text: "THEY ARE KEYSIGNED WITHOUT COMPARING THE CHECK PHRASE: USE ONLY A TICKET THEY GAVE YOU.";
+                    text: "THEY ARE KEYSIGNED WITHOUT COMPARING THE CHECK PHRASE: USE ONLY AN INVITE THEY GAVE YOU.";
                     font-size: 18px;
                     wrap: word-wrap;
                 }
@@ -1942,7 +2031,7 @@ export component AppWindow inherits Window {
                     }
 
                     TermButton {
-                        text: "CONNECT";
+                        text: "ACCEPT";
                         primary: true;
                         enabled: root.connect-text != "" && (!root.connect-keysign || root.connect-name != "");
                         clicked => {
@@ -1971,7 +2060,7 @@ export component AppWindow inherits Window {
                 spacing: 12px;
                 Text {
                     color: Palette.text;
-                    text: "TICKET";
+                    text: "INVITE";
                     font-family: "Doto";
                     font-weight: 900;
                     font-size: 32px;
@@ -1979,7 +2068,7 @@ export component AppWindow inherits Window {
 
                 Text {
                     color: Palette.dim;
-                    text: "SCAN IT WITH K5 ON THE OTHER DEVICE (CONNECT > SCAN QR), OR PASTE IT THERE: IT IS ON THE CLIPBOARD TOO.";
+                    text: "SCAN IT WITH K5 ON THE OTHER DEVICE (ACCEPT INVITE > SCAN QR), OR PASTE IT THERE: IT IS ON THE CLIPBOARD TOO.";
                     font-size: 20px;
                     wrap: word-wrap;
                 }
@@ -2021,7 +2110,7 @@ export component AppWindow inherits Window {
                 spacing: 12px;
                 Text {
                     color: Palette.text;
-                    text: "TICKET";
+                    text: "CREATE INVITE";
                     font-family: "Doto";
                     font-weight: 900;
                     font-size: 32px;
@@ -2029,7 +2118,7 @@ export component AppWindow inherits Window {
 
                 Text {
                     color: Palette.dim;
-                    text: "WHEN SOMEONE PAIRS WITH THIS TICKET:";
+                    text: "WHEN SOMEONE ACCEPTS THIS INVITE:";
                     font-size: 20px;
                     wrap: word-wrap;
                 }
@@ -2074,7 +2163,7 @@ export component AppWindow inherits Window {
 
                 Text {
                     color: Palette.dim;
-                    text: root.ticket-keysign ? "ONLY THE FIRST K5 THAT PAIRS, IN THE NEXT 10 MINUTES. IT IS KEYSIGNED WITHOUT COMPARING THE CHECK PHRASE: GIVE THE TICKET ONLY TO THEM." : "ONLY THE FIRST K5 THAT PAIRS, IN THE NEXT 10 MINUTES.";
+                    text: root.ticket-keysign ? "ONLY THE FIRST K5 THAT PAIRS, IN THE NEXT 10 MINUTES. IT IS KEYSIGNED WITHOUT COMPARING THE CHECK PHRASE: GIVE THE INVITE ONLY TO THEM." : "ONLY THE FIRST K5 THAT PAIRS, IN THE NEXT 10 MINUTES.";
                     font-size: 18px;
                     wrap: word-wrap;
                 }
@@ -2090,7 +2179,7 @@ export component AppWindow inherits Window {
                     }
 
                     TermButton {
-                        text: "COPY TICKET";
+                        text: "COPY INVITE";
                         primary: true;
                         enabled: !root.busy && (!root.ticket-keysign || root.ticket-name != "");
                         clicked => {
@@ -2232,7 +2321,7 @@ export component AppWindow inherits Window {
 
             Text {
                 color: Palette.dim;
-                text: "POINT THE CAMERA AT THE TICKET'S QR CODE, ON THE OTHER DEVICE.";
+                text: "POINT THE CAMERA AT THE INVITE'S QR CODE, ON THE OTHER DEVICE.";
                 font-size: 22px;
                 wrap: word-wrap;
             }

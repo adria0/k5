@@ -43,9 +43,11 @@ if ! docker info >/dev/null 2>&1; then
     exit 1
 fi
 
-if ! docker image inspect "$IMAGE" >/dev/null 2>&1; then
+# The image is rebuilt when its Dockerfile or the pinned toolchain changes.
+IMAGE_TAG="$IMAGE:$(cat "$ROOT/docker/android.Dockerfile" "$ROOT/rust-toolchain.toml" | shasum | cut -c1-12)"
+if ! docker image inspect "$IMAGE_TAG" >/dev/null 2>&1; then
     echo "Building the $IMAGE image (Rust, Android SDK and NDK; only once) ..."
-    docker build --platform linux/amd64 -t "$IMAGE" \
+    docker build --platform linux/amd64 -t "$IMAGE" -t "$IMAGE_TAG" \
         -f "$ROOT/docker/android.Dockerfile" "$ROOT/docker"
 fi
 
@@ -56,7 +58,7 @@ docker run --rm --platform linux/amd64 \
     -v k5-android-cargo-git:/usr/local/cargo/git \
     -v k5-android-keys:/root/.android \
     -e CARGO_TARGET_DIR=/k5/target/android \
-    "$IMAGE" bash -euo pipefail -c '
+    "$IMAGE_TAG" bash -euo pipefail -c '
         # The signing key, kept in its volume: updates install over the
         # previous version.
         KEYSTORE=/root/.android/debug.keystore
