@@ -1,5 +1,13 @@
 # k5
 
+> [!WARNING]
+> k5 is vibecoded, it's not safe at all. Just an experiment.
+> It relies on rpgp's `draft-pqc` implementation of
+> draft-ietf-openpgp-pqc, which is not stable yet: formats may change. Do not
+> use it for anything that matters.
+
+
+
 **A web of trust for online identities, with post-quantum keys.**
 
 Your identity in k5 is your *k5*: the fingerprint of an OpenPGP v6 key with a
@@ -19,10 +27,6 @@ them privately:
   directly, over [iroh](https://www.iroh.computer), with anyone on your web of
   trust.
 
-> [!WARNING]
-> k5 is experimental. It relies on rpgp's `draft-pqc` implementation of
-> draft-ietf-openpgp-pqc, which is not stable yet: formats may change. Do not
-> use it for anything that matters.
 
 ## Quick start
 
